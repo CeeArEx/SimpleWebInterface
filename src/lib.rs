@@ -4,6 +4,10 @@
 // cargo: dep = "reqwest"
 // cargo: dep = "pulldown-cmark"
 // cargo: dep = "futures-util"
+// cargo: dep = "wasm-bindgen"
+// cargo: dep = "wasm-bindgen-futures"
+// cargo: dep = "web-sys"
+// Note: enable web-sys features: ["HtmlSelectElement", "HtmlElement", "HtmlTextAreaElement", "HtmlInputElement", "Window", "Storage"]
 
 mod utils;
 
@@ -17,13 +21,68 @@ use futures_util::StreamExt;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 // -----------------------------------------------------------------------------
-// Data Models (Same as before)
+// Storage & Persistence Helpers
+// -----------------------------------------------------------------------------
+
+const KEY_MESSAGES: &str = "chat_history_v1";
+const KEY_SETTINGS: &str = "chat_settings_v1";
+
+struct LocalStorage;
+
+impl LocalStorage {
+    fn get<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
+        let window = web_sys::window()?;
+        let storage = window.local_storage().ok()??;
+        let json = storage.get_item(key).ok()??;
+        serde_json::from_str(&json).ok()
+    }
+
+    fn set<T: Serialize>(key: &str, value: &T) {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                if let Ok(json) = serde_json::to_string(value) {
+                    let _ = storage.set_item(key, &json);
+                }
+            }
+        }
+    }
+
+    fn remove(key: &str) {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                let _ = storage.remove_item(key);
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Data Models
 // -----------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Message {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AppSettings {
+    pub system_prompt: String,
+    pub base_url: String,
+    pub selected_model: String,
+    pub stream_enabled: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            base_url: "http://localhost:8080".to_string(),
+            selected_model: "default".to_string(),
+            stream_enabled: true,
+        }
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -93,39 +152,71 @@ fn render_markdown(text: &str) -> Html {
 
 #[function_component(App)]
 pub fn app() -> Html {
-    // --- STATE ---
-    let default_sys = "You are a helpful assistant.";
-    let system_prompt = use_state(|| default_sys.to_string());
+    // --- STATE INITIALIZATION (Load from Storage) ---
 
-    let messages = use_state(|| vec![
-        Message {
-            role: "system".to_string(),
-            content: default_sys.to_string(),
-        }
-    ]);
+    // 1. Settings
+    // We load the struct once, then distribute to individual states for UI convenience
+    let initial_settings = LocalStorage::get::<AppSettings>(KEY_SETTINGS).unwrap_or_default();
 
+    let system_prompt = use_state(|| initial_settings.system_prompt.clone());
+    let base_url = use_state(|| initial_settings.base_url.clone());
+    let selected_model = use_state(|| initial_settings.selected_model.clone());
+    let stream_enabled = use_state(|| initial_settings.stream_enabled);
+
+    // 2. Messages
+    let messages = use_state(|| {
+        LocalStorage::get::<Vec<Message>>(KEY_MESSAGES).unwrap_or_else(|| vec![
+            Message {
+                role: "system".to_string(),
+                content: initial_settings.system_prompt.clone(),
+            }
+        ])
+    });
+
+    // 3. Transient UI State (Not saved)
     let input_text = use_state(|| String::new());
-
-    // Editing state
     let editing_index = use_state(|| None::<usize>);
     let edit_buffer = use_state(|| String::new());
-
     let is_loading = use_state(|| false);
     let cancellation_token = use_state(|| Arc::new(AtomicBool::new(false)));
-
-    // Settings
     let show_settings = use_state(|| false);
-    let base_url = use_state(|| "http://localhost:8080".to_string());
     let available_models = use_state(|| Vec::<String>::new());
-    let selected_model = use_state(|| "default".to_string());
-    let stream_enabled = use_state(|| true);
     let settings_error = use_state(|| String::new());
-
-    // Scroll
     let chat_container_ref = use_node_ref();
     let should_auto_scroll = use_state(|| true);
 
-    // --- EFFECTS ---
+    // --- EFFECTS: AUTO-SAVE ---
+
+    // Save Messages whenever they change
+    {
+        let messages = messages.clone();
+        use_effect_with(messages, |msgs| {
+            LocalStorage::set(KEY_MESSAGES, &**msgs);
+        });
+    }
+
+    // Save Settings whenever any config changes
+    {
+        let sp = system_prompt.clone();
+        let bu = base_url.clone();
+        let sm = selected_model.clone();
+        let se = stream_enabled.clone();
+
+        use_effect_with(
+            (sp.clone(), bu.clone(), sm.clone(), se.clone()),
+            move |(sp, bu, sm, se)| {
+                let settings = AppSettings {
+                    system_prompt: (**sp).clone(),
+                    base_url: (**bu).clone(),
+                    selected_model: (**sm).clone(),
+                    stream_enabled: **se,
+                };
+                LocalStorage::set(KEY_SETTINGS, &settings);
+            }
+        );
+    }
+
+    // --- EFFECTS: SCROLLING ---
     {
         let chat_container_ref = chat_container_ref.clone();
         let should_auto_scroll = should_auto_scroll.clone();
@@ -235,9 +326,8 @@ pub fn app() -> Html {
         })
     };
 
-    // --- HANDLERS ---
+    // --- HANDLERS: INPUTS & ACTIONS ---
 
-    // Send New Message
     let perform_send = {
         let messages = messages.clone();
         let input_text = input_text.clone();
@@ -255,7 +345,6 @@ pub fn app() -> Html {
         })
     };
 
-    // 1. Enter Edit Mode
     let on_edit_click = {
         let editing_index = editing_index.clone();
         let edit_buffer = edit_buffer.clone();
@@ -268,7 +357,6 @@ pub fn app() -> Html {
         })
     };
 
-    // 2. Cancel Edit
     let on_edit_cancel = {
         let editing_index = editing_index.clone();
         let edit_buffer = edit_buffer.clone();
@@ -278,7 +366,6 @@ pub fn app() -> Html {
         })
     };
 
-    // 3. Save Edit (Branching Logic)
     let on_edit_save = {
         let editing_index = editing_index.clone();
         let edit_buffer = edit_buffer.clone();
@@ -309,7 +396,6 @@ pub fn app() -> Html {
         })
     };
 
-    // Standard Inputs
     let on_submit_click = {
         let perform_send = perform_send.clone();
         Callback::from(move |e: SubmitEvent| { e.prevent_default(); perform_send.emit(()); })
@@ -331,7 +417,6 @@ pub fn app() -> Html {
         })
     };
 
-    // Settings Handlers
     let on_scroll_chat = {
         let should_auto_scroll = should_auto_scroll.clone();
         Callback::from(move |e: Event| {
@@ -344,6 +429,9 @@ pub fn app() -> Html {
         let show_settings = show_settings.clone();
         Callback::from(move |_| show_settings.set(!*show_settings))
     };
+
+    // --- SETTINGS HANDLERS ---
+
     let on_system_prompt_change = {
         let system_prompt = system_prompt.clone();
         let messages = messages.clone();
@@ -351,6 +439,7 @@ pub fn app() -> Html {
             let input: HtmlTextAreaElement = e.target_unchecked_into();
             let val = input.value();
             system_prompt.set(val.clone());
+            // Update the live system message if it's the first one
             let mut current_msgs = (*messages).clone();
             if let Some(first) = current_msgs.first_mut() {
                 if first.role == "system" { first.content = val; messages.set(current_msgs); }
@@ -378,6 +467,51 @@ pub fn app() -> Html {
             selected_model.set(select.value());
         })
     };
+
+    // --- CLEANUP HANDLERS (Wipe Data) ---
+
+    let on_clear_history = {
+        let messages = messages.clone();
+        let system_prompt = system_prompt.clone();
+        Callback::from(move |_| {
+            if web_sys::window().unwrap().confirm_with_message("Delete all chat history?").unwrap_or(false) {
+                messages.set(vec![Message { role: "system".into(), content: (*system_prompt).clone() }]);
+                LocalStorage::remove(KEY_MESSAGES);
+            }
+        })
+    };
+
+    let on_wipe_settings = {
+        let system_prompt = system_prompt.clone();
+        let base_url = base_url.clone();
+        let selected_model = selected_model.clone();
+        let stream_enabled = stream_enabled.clone();
+        let messages = messages.clone();
+        let available_models = available_models.clone();
+
+        Callback::from(move |_| {
+            if web_sys::window().unwrap().confirm_with_message("Reset all settings to default?").unwrap_or(false) {
+                LocalStorage::remove(KEY_SETTINGS);
+                let def = AppSettings::default();
+
+                system_prompt.set(def.system_prompt.clone());
+                base_url.set(def.base_url);
+                selected_model.set(def.selected_model);
+                stream_enabled.set(def.stream_enabled);
+                available_models.set(Vec::new());
+
+                // Reset chat history logic to use the default prompt
+                let mut current_msgs = (*messages).clone();
+                if let Some(first) = current_msgs.first_mut() {
+                    if first.role == "system" {
+                        first.content = def.system_prompt;
+                        messages.set(current_msgs);
+                    }
+                }
+            }
+        })
+    };
+
     let on_stop = {
         let cancellation_token = cancellation_token.clone();
         let is_loading = is_loading.clone();
@@ -386,6 +520,7 @@ pub fn app() -> Html {
             is_loading.set(false);
         })
     };
+
     let on_fetch_models = {
         let base_url = base_url.clone();
         let available_models = available_models.clone();
@@ -433,6 +568,8 @@ pub fn app() -> Html {
             .msg-container:hover .msg-actions { opacity: 1; }
             .btn-edit { background: none; border: none; color: #666; cursor: pointer; text-decoration: underline; padding: 0; }
             .btn-edit:hover { color: #000; }
+            .danger-btn { background-color: #ffebee; color: #c62828; border: 1px solid #c62828; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 0.9em; margin-top: 5px; width: 100%; }
+            .danger-btn:hover { background-color: #ffcdd2; }
             " }
         </style>
     };
@@ -463,13 +600,16 @@ pub fn app() -> Html {
             if *show_settings {
                 <div style="position: absolute; top: 60px; right: 20px; width: 320px; background: white; border: 1px solid #aaa; box-shadow: 0 4px 8px rgba(0,0,0,0.1); padding: 15px; border-radius: 8px; z-index: 10;">
                     <h3>{ "Configuration" }</h3>
+
                     <label style="display: block; margin-bottom: 5px; font-weight: bold;">{ "System Prompt:" }</label>
                     <textarea value={(*system_prompt).clone()} oninput={on_system_prompt_change} style="width: 100%; height: 80px; margin-bottom: 15px; padding: 5px; font-family: sans-serif; resize: vertical;" />
+
                     <label style="display: block; margin-bottom: 5px;">{ "Server URL:" }</label>
                     <div style="display: flex; gap: 5px; margin-bottom: 15px;">
                         <input type="text" value={(*base_url).clone()} oninput={on_url_change} style="flex-grow: 1;" />
                         <button onclick={on_fetch_models}>{ "⟳" }</button>
                     </div>
+
                     <label style="display: block; margin-bottom: 5px;">{ "Select Model:" }</label>
                     <select onchange={on_model_select} style="width: 100%; margin-bottom: 15px; padding: 5px;">
                         {
@@ -477,10 +617,23 @@ pub fn app() -> Html {
                             else { html! { for available_models.iter().map(|m| { let selected = m == &*selected_model; html! { <option value={m.clone()} selected={selected}>{ m }</option> } }) } }
                         }
                     </select>
-                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 15px;">
                         <input type="checkbox" checked={*stream_enabled} onchange={on_stream_change} />
                         { "Enable Streaming" }
                     </label>
+
+                    <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;" />
+
+                    <div style="display: flex; flex-direction: column; gap: 10px;">
+                        <button onclick={on_clear_history} class="danger-btn">
+                            { "🗑 Delete All Chats" }
+                        </button>
+                        <button onclick={on_wipe_settings} class="danger-btn">
+                            { "⚠ Reset All Settings" }
+                        </button>
+                    </div>
+
                     if !settings_error.is_empty() { <div style="color: red; font-size: 0.8em; margin-top: 10px;">{ &*settings_error }</div> }
                 </div>
             }
@@ -490,11 +643,8 @@ pub fn app() -> Html {
                     for messages.iter().enumerate().map(|(idx, msg)| {
                         let is_user = msg.role == "user";
                         let is_editing = *editing_index == Some(idx);
-
-                        // --- FIX: CLONE CALLBACKS FOR EACH ITERATION ---
                         let on_save_click = on_edit_save.clone();
                         let on_edit_open = on_edit_click.clone();
-                        // -----------------------------------------------
 
                         html! {
                             <div class="msg-container" style={get_bubble_style(&msg.role)}>
