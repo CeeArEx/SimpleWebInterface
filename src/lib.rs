@@ -7,7 +7,8 @@
 // cargo: dep = "wasm-bindgen"
 // cargo: dep = "wasm-bindgen-futures"
 // cargo: dep = "web-sys"
-// Note: enable web-sys features: ["HtmlSelectElement", "HtmlElement", "HtmlTextAreaElement", "HtmlInputElement", "Window", "Storage"]
+// cargo: dep = "uuid"
+// cargo: dep = "js-sys"
 
 mod utils;
 
@@ -15,17 +16,22 @@ use yew::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{HtmlSelectElement, HtmlElement, HtmlTextAreaElement, Event, HtmlInputElement};
+use web_sys::{HtmlSelectElement, HtmlElement, HtmlTextAreaElement, HtmlInputElement};
 use pulldown_cmark::{Parser, Options, html, Event as MdEvent};
 use futures_util::StreamExt;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use uuid::Uuid;
 
 // -----------------------------------------------------------------------------
-// Storage & Persistence Helpers
+// Storage Keys
 // -----------------------------------------------------------------------------
 
-const KEY_MESSAGES: &str = "chat_history_v1";
+const KEY_CHATS: &str = "llm_chats_v2";
 const KEY_SETTINGS: &str = "chat_settings_v1";
+
+// -----------------------------------------------------------------------------
+// Storage Helper
+// -----------------------------------------------------------------------------
 
 struct LocalStorage;
 
@@ -46,14 +52,6 @@ impl LocalStorage {
             }
         }
     }
-
-    fn remove(key: &str) {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let _ = storage.remove_item(key);
-            }
-        }
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -64,6 +62,14 @@ impl LocalStorage {
 pub struct Message {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ChatSession {
+    pub id: String,
+    pub title: String,
+    pub messages: Vec<Message>,
+    pub created_at: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -132,18 +138,26 @@ fn render_markdown(text: &str) -> Html {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
-
-    let parser = Parser::new_ext(text, options)
-        .map(|event| match event {
-            MdEvent::SoftBreak => MdEvent::HardBreak,
-            _ => event,
-        });
-
+    let parser = Parser::new_ext(text, options).map(|event| match event {
+        MdEvent::SoftBreak => MdEvent::HardBreak,
+        _ => event,
+    });
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
-
     let styled_html = format!(r#"<div class="markdown-body">{}</div>"#, html_output);
     Html::from_html_unchecked(AttrValue::from(styled_html))
+}
+
+fn create_new_chat(system_prompt: String) -> ChatSession {
+    ChatSession {
+        id: Uuid::new_v4().to_string(),
+        title: "New Chat".to_string(),
+        messages: vec![Message {
+            role: "system".to_string(),
+            content: system_prompt,
+        }],
+        created_at: js_sys::Date::now(),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -152,10 +166,7 @@ fn render_markdown(text: &str) -> Html {
 
 #[function_component(App)]
 pub fn app() -> Html {
-    // --- STATE INITIALIZATION (Load from Storage) ---
-
-    // 1. Settings
-    // We load the struct once, then distribute to individual states for UI convenience
+    // --- STATE INITIALIZATION ---
     let initial_settings = LocalStorage::get::<AppSettings>(KEY_SETTINGS).unwrap_or_default();
 
     let system_prompt = use_state(|| initial_settings.system_prompt.clone());
@@ -163,17 +174,20 @@ pub fn app() -> Html {
     let selected_model = use_state(|| initial_settings.selected_model.clone());
     let stream_enabled = use_state(|| initial_settings.stream_enabled);
 
-    // 2. Messages
-    let messages = use_state(|| {
-        LocalStorage::get::<Vec<Message>>(KEY_MESSAGES).unwrap_or_else(|| vec![
-            Message {
-                role: "system".to_string(),
-                content: initial_settings.system_prompt.clone(),
-            }
-        ])
+    let chats = use_state(|| {
+        LocalStorage::get::<Vec<ChatSession>>(KEY_CHATS).unwrap_or_else(|| {
+            vec![create_new_chat(initial_settings.system_prompt.clone())]
+        })
     });
 
-    // 3. Transient UI State (Not saved)
+    let active_chat_id = use_state(|| {
+        chats.first().map(|c| c.id.clone()).unwrap_or_default()
+    });
+
+    // New State to trigger title generation cleanly
+    let title_check_queue = use_state(|| None::<String>);
+
+    let sidebar_open = use_state(|| true);
     let input_text = use_state(|| String::new());
     let editing_index = use_state(|| None::<usize>);
     let edit_buffer = use_state(|| String::new());
@@ -185,42 +199,43 @@ pub fn app() -> Html {
     let chat_container_ref = use_node_ref();
     let should_auto_scroll = use_state(|| true);
 
-    // --- EFFECTS: AUTO-SAVE ---
+    // --- COMPUTED: CURRENT CHAT ---
+    let current_chat_idx = chats.iter().position(|c| c.id == *active_chat_id);
+    let current_messages = if let Some(idx) = current_chat_idx {
+        chats[idx].messages.clone()
+    } else {
+        vec![]
+    };
 
-    // Save Messages whenever they change
+    // --- EFFECTS: PERSISTENCE ---
     {
-        let messages = messages.clone();
-        use_effect_with(messages, |msgs| {
-            LocalStorage::set(KEY_MESSAGES, &**msgs);
+        let chats = chats.clone();
+        use_effect_with(chats, |chats_state| {
+            LocalStorage::set(KEY_CHATS, &**chats_state);
         });
     }
 
-    // Save Settings whenever any config changes
     {
         let sp = system_prompt.clone();
         let bu = base_url.clone();
         let sm = selected_model.clone();
         let se = stream_enabled.clone();
-
-        use_effect_with(
-            (sp.clone(), bu.clone(), sm.clone(), se.clone()),
-            move |(sp, bu, sm, se)| {
-                let settings = AppSettings {
-                    system_prompt: (**sp).clone(),
-                    base_url: (**bu).clone(),
-                    selected_model: (**sm).clone(),
-                    stream_enabled: **se,
-                };
-                LocalStorage::set(KEY_SETTINGS, &settings);
-            }
-        );
+        use_effect_with((sp.clone(), bu.clone(), sm.clone(), se.clone()), move |(sp, bu, sm, se)| {
+            let settings = AppSettings {
+                system_prompt: (**sp).clone(),
+                base_url: (**bu).clone(),
+                selected_model: (**sm).clone(),
+                stream_enabled: **se,
+            };
+            LocalStorage::set(KEY_SETTINGS, &settings);
+        });
     }
 
-    // --- EFFECTS: SCROLLING ---
+    // Scroll to bottom
     {
         let chat_container_ref = chat_container_ref.clone();
         let should_auto_scroll = should_auto_scroll.clone();
-        use_effect_with(messages.clone(), move |_| {
+        use_effect_with(chats.clone(), move |_| {
             if *should_auto_scroll {
                 if let Some(div) = chat_container_ref.cast::<HtmlElement>() {
                     div.set_scroll_top(div.scroll_height());
@@ -229,26 +244,105 @@ pub fn app() -> Html {
         });
     }
 
+    // --- LOGIC: TITLE GENERATION (Decoupled Effect) ---
+    {
+        let chats = chats.clone();
+        let base_url = base_url.clone();
+        let selected_model = selected_model.clone();
+        let title_check_queue = title_check_queue.clone();
+
+        use_effect_with(title_check_queue.clone(), move |queue_state| {
+            if let Some(chat_id) = &**queue_state {
+                let chat_id = chat_id.clone();
+                let chats = chats.clone();
+                let clean_url = base_url.trim_end_matches('/').to_string();
+                let model_id = (*selected_model).clone();
+
+                // 1. Check if we actually need to generate a title
+                // We do this check synchronously to determine if we should spawn the task
+                let need_title = if let Some(chat) = chats.iter().find(|c| c.id == chat_id) {
+                    chat.messages.len() <= 4 && chat.title == "New Chat"
+                } else {
+                    false
+                };
+
+                if need_title {
+                    let msgs_opt = chats.iter().find(|c| c.id == chat_id).map(|c| c.messages.clone());
+
+                    if let Some(msgs) = msgs_opt {
+                        spawn_local(async move {
+                            let client = reqwest::Client::new();
+                            let mut summary_messages = msgs.clone();
+                            summary_messages.push(Message {
+                                role: "user".into(),
+                                content: "Based on the conversation above, generate a short, relevant title for this chat (max 4-6 words). Do not use quotes.".into()
+                            });
+
+                            let request_body = ChatRequest {
+                                messages: summary_messages,
+                                model: model_id,
+                                temperature: 0.7,
+                                stream: false,
+                            };
+
+                            if let Ok(resp) = client.post(format!("{}/v1/chat/completions", clean_url)).json(&request_body).send().await {
+                                if let Ok(json) = resp.json::<ChatResponse>().await {
+                                    if let Some(choice) = json.choices.first() {
+                                        let new_title = choice.message.content.trim().to_string();
+
+                                        // 2. Safe Update: Re-read state inside the async completion
+                                        let mut current_chats = (*chats).clone();
+                                        if let Some(chat) = current_chats.iter_mut().find(|c| c.id == chat_id) {
+                                            // Only update if the title is still "New Chat" (avoid overwrites if user renamed it manually)
+                                            if chat.title == "New Chat" {
+                                                chat.title = new_title;
+                                                chats.set(current_chats);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+
     // --- LOGIC: CHAT COMPLETION ---
     let run_chat_completion = {
-        let messages_state = messages.clone();
+        let chats = chats.clone();
+        let active_chat_id = active_chat_id.clone();
         let is_loading = is_loading.clone();
         let base_url = base_url.clone();
         let selected_model = selected_model.clone();
         let stream_enabled = stream_enabled.clone();
         let cancellation_token = cancellation_token.clone();
+        let title_check_queue = title_check_queue.clone();
 
         Callback::from(move |history_to_send: Vec<Message>| {
+            let current_id = (*active_chat_id).clone();
             is_loading.set(true);
             cancellation_token.store(false, Ordering::Relaxed);
-            messages_state.set(history_to_send.clone());
 
-            let messages_state = messages_state.clone();
+            // Optimistic Update
+            {
+                let mut current_chats = (*chats).clone();
+                if let Some(chat) = current_chats.iter_mut().find(|c| c.id == current_id) {
+                    chat.messages = history_to_send.clone();
+                    chats.set(current_chats);
+                }
+            }
+
+            let chats_state = chats.clone();
             let is_loading_state = is_loading.clone();
             let clean_url = base_url.trim_end_matches('/').to_string();
             let model_id = (*selected_model).clone();
             let is_stream = *stream_enabled;
             let cancel_flag = cancellation_token.clone();
+            let target_chat_id = current_id.clone();
+            let title_queue = title_check_queue.clone();
 
             spawn_local(async move {
                 let client = reqwest::Client::new();
@@ -269,7 +363,14 @@ pub fn app() -> Html {
                         if is_stream {
                             let mut stream_history = history_to_send.clone();
                             stream_history.push(Message { role: "assistant".into(), content: "".into() });
-                            messages_state.set(stream_history.clone());
+
+                            {
+                                let mut current_chats = (*chats_state).clone();
+                                if let Some(chat) = current_chats.iter_mut().find(|c| c.id == target_chat_id) {
+                                    chat.messages = stream_history.clone();
+                                    chats_state.set(current_chats);
+                                }
+                            }
 
                             let mut stream = response.bytes_stream();
                             let mut buffer = String::new();
@@ -293,7 +394,13 @@ pub fn app() -> Html {
                                                         if let Some(last_msg) = stream_history.last_mut() {
                                                             last_msg.content.push_str(content);
                                                         }
-                                                        messages_state.set(stream_history.clone());
+
+                                                        // Update state repeatedly
+                                                        let mut current_chats = (*chats_state).clone();
+                                                        if let Some(chat) = current_chats.iter_mut().find(|c| c.id == target_chat_id) {
+                                                            chat.messages = stream_history.clone();
+                                                            chats_state.set(current_chats);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -307,7 +414,12 @@ pub fn app() -> Html {
                                     if let Some(choice) = json.choices.first() {
                                         let mut new_hist = history_to_send;
                                         new_hist.push(choice.message.clone());
-                                        messages_state.set(new_hist);
+
+                                        let mut current_chats = (*chats_state).clone();
+                                        if let Some(chat) = current_chats.iter_mut().find(|c| c.id == target_chat_id) {
+                                            chat.messages = new_hist;
+                                            chats_state.set(current_chats);
+                                        }
                                     }
                                 }
                             }
@@ -317,82 +429,99 @@ pub fn app() -> Html {
                         if !cancel_flag.load(Ordering::Relaxed) {
                             let mut error_hist = history_to_send;
                             error_hist.push(Message { role: "system".into(), content: format!("Error: {}", e) });
-                            messages_state.set(error_hist);
+                            let mut current_chats = (*chats_state).clone();
+                            if let Some(chat) = current_chats.iter_mut().find(|c| c.id == target_chat_id) {
+                                chat.messages = error_hist;
+                                chats_state.set(current_chats);
+                            }
                         }
                     }
                 }
                 is_loading_state.set(false);
+
+                // Trigger Title Generation via State Change
+                // This ensures the effect runs in the main scope with fresh handles
+                title_queue.set(Some(target_chat_id));
             });
         })
     };
 
-    // --- HANDLERS: INPUTS & ACTIONS ---
+    // --- ACTIONS ---
+
+    let on_new_chat = {
+        let chats = chats.clone();
+        let active_chat_id = active_chat_id.clone();
+        let system_prompt = system_prompt.clone();
+        Callback::from(move |_| {
+            let new_chat = create_new_chat((*system_prompt).clone());
+            let new_id = new_chat.id.clone();
+            let mut current = (*chats).clone();
+            current.insert(0, new_chat);
+            chats.set(current);
+            active_chat_id.set(new_id);
+        })
+    };
+
+    let on_select_chat = {
+        let active_chat_id = active_chat_id.clone();
+        Callback::from(move |id: String| {
+            active_chat_id.set(id);
+        })
+    };
+
+    let on_delete_chat = {
+        let chats = chats.clone();
+        let active_chat_id = active_chat_id.clone();
+        let system_prompt = system_prompt.clone();
+        Callback::from(move |(e, id): (MouseEvent, String)| {
+            e.stop_propagation();
+            if web_sys::window().unwrap().confirm_with_message("Delete this chat?").unwrap_or(false) {
+                let mut current = (*chats).clone();
+                current.retain(|c| c.id != id);
+
+                if *active_chat_id == id {
+                    if let Some(first) = current.first() {
+                        active_chat_id.set(first.id.clone());
+                    } else {
+                        let new_chat = create_new_chat((*system_prompt).clone());
+                        active_chat_id.set(new_chat.id.clone());
+                        current.push(new_chat);
+                    }
+                }
+                chats.set(current);
+            }
+        })
+    };
+
+    let on_clear_all_chats = {
+        let chats = chats.clone();
+        let active_chat_id = active_chat_id.clone();
+        let system_prompt = system_prompt.clone();
+        Callback::from(move |_| {
+            if web_sys::window().unwrap().confirm_with_message("Irreversibly delete ALL chat history?").unwrap_or(false) {
+                let new_chat = create_new_chat((*system_prompt).clone());
+                chats.set(vec![new_chat.clone()]);
+                active_chat_id.set(new_chat.id);
+            }
+        })
+    };
 
     let perform_send = {
-        let messages = messages.clone();
         let input_text = input_text.clone();
         let is_loading = is_loading.clone();
         let should_auto_scroll = should_auto_scroll.clone();
         let run_chat_completion = run_chat_completion.clone();
+        let current_messages = current_messages.clone();
 
         Callback::from(move |_: ()| {
             if input_text.is_empty() || *is_loading { return; }
             should_auto_scroll.set(true);
-            let mut new_history = (*messages).clone();
-            new_history.push(Message { role: "user".into(), content: (*input_text).clone() });
+
+            let mut history_to_send = current_messages.clone();
+            history_to_send.push(Message { role: "user".into(), content: (*input_text).clone() });
+
             input_text.set(String::new());
-            run_chat_completion.emit(new_history);
-        })
-    };
-
-    let on_edit_click = {
-        let editing_index = editing_index.clone();
-        let edit_buffer = edit_buffer.clone();
-        let messages = messages.clone();
-        Callback::from(move |idx: usize| {
-            if let Some(msg) = messages.get(idx) {
-                editing_index.set(Some(idx));
-                edit_buffer.set(msg.content.clone());
-            }
-        })
-    };
-
-    let on_edit_cancel = {
-        let editing_index = editing_index.clone();
-        let edit_buffer = edit_buffer.clone();
-        Callback::from(move |_| {
-            editing_index.set(None);
-            edit_buffer.set(String::new());
-        })
-    };
-
-    let on_edit_save = {
-        let editing_index = editing_index.clone();
-        let edit_buffer = edit_buffer.clone();
-        let messages = messages.clone();
-        let run_chat_completion = run_chat_completion.clone();
-        let should_auto_scroll = should_auto_scroll.clone();
-
-        Callback::from(move |idx: usize| {
-            should_auto_scroll.set(true);
-            let mut branched_history = (*messages).clone();
-            if idx < branched_history.len() {
-                branched_history.truncate(idx + 1);
-            }
-            if let Some(msg) = branched_history.last_mut() {
-                msg.content = (*edit_buffer).clone();
-            }
-            editing_index.set(None);
-            edit_buffer.set(String::new());
-            run_chat_completion.emit(branched_history);
-        })
-    };
-
-    let on_edit_input = {
-        let edit_buffer = edit_buffer.clone();
-        Callback::from(move |e: InputEvent| {
-            let input: HtmlTextAreaElement = e.target_unchecked_into();
-            edit_buffer.set(input.value());
+            run_chat_completion.emit(history_to_send);
         })
     };
 
@@ -417,6 +546,50 @@ pub fn app() -> Html {
         })
     };
 
+    let on_edit_click = {
+        let editing_index = editing_index.clone();
+        let edit_buffer = edit_buffer.clone();
+        let msgs = current_messages.clone();
+        Callback::from(move |idx: usize| {
+            if let Some(msg) = msgs.get(idx) {
+                editing_index.set(Some(idx));
+                edit_buffer.set(msg.content.clone());
+            }
+        })
+    };
+
+    let on_edit_save = {
+        let editing_index = editing_index.clone();
+        let edit_buffer = edit_buffer.clone();
+        let msgs = current_messages.clone();
+        let run_chat_completion = run_chat_completion.clone();
+        Callback::from(move |idx: usize| {
+            let mut branched_history = msgs.clone();
+            if idx < branched_history.len() {
+                branched_history.truncate(idx + 1);
+            }
+            if let Some(msg) = branched_history.last_mut() {
+                msg.content = (*edit_buffer).clone();
+            }
+            editing_index.set(None);
+            edit_buffer.set(String::new());
+            run_chat_completion.emit(branched_history);
+        })
+    };
+
+    let on_edit_cancel = {
+        let editing_index = editing_index.clone();
+        Callback::from(move |_| editing_index.set(None))
+    };
+
+    let on_edit_input = {
+        let edit_buffer = edit_buffer.clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlTextAreaElement = e.target_unchecked_into();
+            edit_buffer.set(input.value());
+        })
+    };
+
     let on_scroll_chat = {
         let should_auto_scroll = should_auto_scroll.clone();
         Callback::from(move |e: Event| {
@@ -429,21 +602,16 @@ pub fn app() -> Html {
         let show_settings = show_settings.clone();
         Callback::from(move |_| show_settings.set(!*show_settings))
     };
-
-    // --- SETTINGS HANDLERS ---
+    let on_toggle_sidebar = {
+        let sidebar_open = sidebar_open.clone();
+        Callback::from(move |_| sidebar_open.set(!*sidebar_open))
+    };
 
     let on_system_prompt_change = {
         let system_prompt = system_prompt.clone();
-        let messages = messages.clone();
         Callback::from(move |e: InputEvent| {
             let input: HtmlTextAreaElement = e.target_unchecked_into();
-            let val = input.value();
-            system_prompt.set(val.clone());
-            // Update the live system message if it's the first one
-            let mut current_msgs = (*messages).clone();
-            if let Some(first) = current_msgs.first_mut() {
-                if first.role == "system" { first.content = val; messages.set(current_msgs); }
-            }
+            system_prompt.set(input.value());
         })
     };
     let on_url_change = {
@@ -467,60 +635,6 @@ pub fn app() -> Html {
             selected_model.set(select.value());
         })
     };
-
-    // --- CLEANUP HANDLERS (Wipe Data) ---
-
-    let on_clear_history = {
-        let messages = messages.clone();
-        let system_prompt = system_prompt.clone();
-        Callback::from(move |_| {
-            if web_sys::window().unwrap().confirm_with_message("Delete all chat history?").unwrap_or(false) {
-                messages.set(vec![Message { role: "system".into(), content: (*system_prompt).clone() }]);
-                LocalStorage::remove(KEY_MESSAGES);
-            }
-        })
-    };
-
-    let on_wipe_settings = {
-        let system_prompt = system_prompt.clone();
-        let base_url = base_url.clone();
-        let selected_model = selected_model.clone();
-        let stream_enabled = stream_enabled.clone();
-        let messages = messages.clone();
-        let available_models = available_models.clone();
-
-        Callback::from(move |_| {
-            if web_sys::window().unwrap().confirm_with_message("Reset all settings to default?").unwrap_or(false) {
-                LocalStorage::remove(KEY_SETTINGS);
-                let def = AppSettings::default();
-
-                system_prompt.set(def.system_prompt.clone());
-                base_url.set(def.base_url);
-                selected_model.set(def.selected_model);
-                stream_enabled.set(def.stream_enabled);
-                available_models.set(Vec::new());
-
-                // Reset chat history logic to use the default prompt
-                let mut current_msgs = (*messages).clone();
-                if let Some(first) = current_msgs.first_mut() {
-                    if first.role == "system" {
-                        first.content = def.system_prompt;
-                        messages.set(current_msgs);
-                    }
-                }
-            }
-        })
-    };
-
-    let on_stop = {
-        let cancellation_token = cancellation_token.clone();
-        let is_loading = is_loading.clone();
-        Callback::from(move |_| {
-            cancellation_token.store(true, Ordering::Relaxed);
-            is_loading.set(false);
-        })
-    };
-
     let on_fetch_models = {
         let base_url = base_url.clone();
         let available_models = available_models.clone();
@@ -554,7 +668,41 @@ pub fn app() -> Html {
         })
     };
 
+    let on_stop = {
+        let cancellation_token = cancellation_token.clone();
+        let is_loading = is_loading.clone();
+        Callback::from(move |_| {
+            cancellation_token.store(true, Ordering::Relaxed);
+            is_loading.set(false);
+        })
+    };
+
+    let on_reset_settings = {
+        let system_prompt = system_prompt.clone();
+        let base_url = base_url.clone();
+        let selected_model = selected_model.clone();
+        let stream_enabled = stream_enabled.clone();
+        Callback::from(move |_| {
+            if web_sys::window().unwrap().confirm_with_message("Reset settings?").unwrap_or(false) {
+                let def = AppSettings::default();
+                system_prompt.set(def.system_prompt);
+                base_url.set(def.base_url);
+                selected_model.set(def.selected_model);
+                stream_enabled.set(def.stream_enabled);
+            }
+        })
+    };
+
     // --- STYLES ---
+
+    let app_style = "display: flex; height: 100vh; overflow: hidden; font-family: sans-serif; color: #333;";
+    let sidebar_width = if *sidebar_open { "260px" } else { "0px" };
+    let sidebar_style = format!(
+        "width: {}; background-color: #f7f7f7; border-right: 1px solid #ddd; display: flex; flex-direction: column; transition: width 0.3s ease; overflow: hidden; flex-shrink: 0;",
+        sidebar_width
+    );
+    let main_style = "flex-grow: 1; display: flex; flex-direction: column; position: relative; min-width: 0;";
+
     let global_styles = html! {
         <style>
             { "
@@ -564,153 +712,162 @@ pub fn app() -> Html {
             .markdown-body pre code { background: transparent; color: inherit; }
             .chat-scroll-container { scroll-behavior: smooth; }
             textarea { resize: none; overflow-y: auto; }
-            .msg-actions { opacity: 0; transition: opacity 0.2s; margin-top: 5px; font-size: 0.8em; }
-            .msg-container:hover .msg-actions { opacity: 1; }
-            .btn-edit { background: none; border: none; color: #666; cursor: pointer; text-decoration: underline; padding: 0; }
-            .btn-edit:hover { color: #000; }
-            .danger-btn { background-color: #ffebee; color: #c62828; border: 1px solid #c62828; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 0.9em; margin-top: 5px; width: 100%; }
-            .danger-btn:hover { background-color: #ffcdd2; }
+            .chat-item { padding: 10px; cursor: pointer; border-bottom: 1px solid #eee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; justify-content: space-between; align-items: center; }
+            .chat-item:hover { background-color: #eee; }
+            .chat-item.active { background-color: #e3f2fd; border-left: 4px solid #2196f3; }
+            .chat-item .del-btn { opacity: 0; background: none; border: none; color: #999; font-weight: bold; cursor: pointer; padding: 0 5px; }
+            .chat-item:hover .del-btn { opacity: 1; }
+            .chat-item .del-btn:hover { color: red; }
+            .btn-icon { background: none; border: none; cursor: pointer; font-size: 1.2rem; padding: 5px; }
+            .new-chat-btn { margin: 10px; padding: 10px; background-color: #2196f3; color: white; border: none; border-radius: 4px; cursor: pointer; text-align: center; }
+            .new-chat-btn:hover { background-color: #1976d2; }
             " }
         </style>
     };
 
-    let container_style = "font-family: sans-serif; max_width: 800px; margin: 0 auto; padding: 20px; position: relative;";
-    let chat_box_style = "border: 1px solid #ccc; padding: 10px; height: 500px; overflow-y: auto; margin-bottom: 10px; border-radius: 4px; display: flex; flex-direction: column; gap: 10px;";
-
     let get_bubble_style = |role: &str| {
         if role == "user" {
-            "background-color: #e1f5fe; padding: 10px; text-align: left; border-radius: 10px 10px 0 10px; align-self: flex-end; max-width: 80%; box-shadow: 1px 1px 2px rgba(0,0,0,0.1); position: relative;"
+            "background-color: #e1f5fe; padding: 10px; border-radius: 10px 10px 0 10px; align-self: flex-end; max-width: 80%; box-shadow: 1px 1px 2px rgba(0,0,0,0.1);"
         } else if role == "system" {
-            "background-color: #f8f9fa; color: #666; padding: 8px; border-radius: 8px; align-self: center; font-size: 0.85em; width: 90%; border: 1px dashed #ccc;"
+            "background-color: #fff3cd; color: #666; padding: 8px; border-radius: 8px; align-self: center; font-size: 0.85em; width: 90%; border: 1px dashed #ccc;"
         } else {
-            "background-color: #f1f1f1; padding: 10px; text-align: left; border-radius: 10px 10px 10px 0; align-self: flex-start; max-width: 80%; box-shadow: 1px 1px 2px rgba(0,0,0,0.1);"
+            "background-color: #f1f1f1; padding: 10px; border-radius: 10px 10px 10px 0; align-self: flex-start; max-width: 80%; box-shadow: 1px 1px 2px rgba(0,0,0,0.1);"
         }
     };
 
     html! {
-        <div style={container_style}>
+        <div style={app_style}>
             { global_styles }
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                <h1 style="margin: 0;">{ "Local LLM Chat" }</h1>
-                <button onclick={on_toggle_settings} style="padding: 5px 10px; cursor: pointer;">
-                    { if *show_settings { "Close Settings" } else { "⚙ Settings" } }
-                </button>
-            </div>
 
-            if *show_settings {
-                <div style="position: absolute; top: 60px; right: 20px; width: 320px; background: white; border: 1px solid #aaa; box-shadow: 0 4px 8px rgba(0,0,0,0.1); padding: 15px; border-radius: 8px; z-index: 10;">
-                    <h3>{ "Configuration" }</h3>
+            <div style={sidebar_style}>
+                <button class="new-chat-btn" onclick={on_new_chat}>{ "+ New Chat" }</button>
+                <div style="flex-grow: 1; overflow-y: auto;">
+                    {
+                        for chats.iter().map(|chat| {
+                            let id = chat.id.clone();
+                            let is_active = id == *active_chat_id;
+                            let active_class = if is_active { "active" } else { "" };
 
-                    <label style="display: block; margin-bottom: 5px; font-weight: bold;">{ "System Prompt:" }</label>
-                    <textarea value={(*system_prompt).clone()} oninput={on_system_prompt_change} style="width: 100%; height: 80px; margin-bottom: 15px; padding: 5px; font-family: sans-serif; resize: vertical;" />
+                            let on_select = on_select_chat.clone();
+                            let id_for_select = id.clone();
 
-                    <label style="display: block; margin-bottom: 5px;">{ "Server URL:" }</label>
-                    <div style="display: flex; gap: 5px; margin-bottom: 15px;">
-                        <input type="text" value={(*base_url).clone()} oninput={on_url_change} style="flex-grow: 1;" />
-                        <button onclick={on_fetch_models}>{ "⟳" }</button>
-                    </div>
+                            let on_del = on_delete_chat.clone();
+                            let id_for_delete = id.clone();
 
-                    <label style="display: block; margin-bottom: 5px;">{ "Select Model:" }</label>
-                    <select onchange={on_model_select} style="width: 100%; margin-bottom: 15px; padding: 5px;">
-                        {
-                            if available_models.is_empty() { html! { <option value="default">{ "Default (Manual)" }</option> } }
-                            else { html! { for available_models.iter().map(|m| { let selected = m == &*selected_model; html! { <option value={m.clone()} selected={selected}>{ m }</option> } }) } }
-                        }
-                    </select>
-
-                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 15px;">
-                        <input type="checkbox" checked={*stream_enabled} onchange={on_stream_change} />
-                        { "Enable Streaming" }
-                    </label>
-
-                    <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;" />
-
-                    <div style="display: flex; flex-direction: column; gap: 10px;">
-                        <button onclick={on_clear_history} class="danger-btn">
-                            { "🗑 Delete All Chats" }
-                        </button>
-                        <button onclick={on_wipe_settings} class="danger-btn">
-                            { "⚠ Reset All Settings" }
-                        </button>
-                    </div>
-
-                    if !settings_error.is_empty() { <div style="color: red; font-size: 0.8em; margin-top: 10px;">{ &*settings_error }</div> }
-                </div>
-            }
-
-            <div class="chat-scroll-container" style={chat_box_style} ref={chat_container_ref} onscroll={on_scroll_chat}>
-                {
-                    for messages.iter().enumerate().map(|(idx, msg)| {
-                        let is_user = msg.role == "user";
-                        let is_editing = *editing_index == Some(idx);
-                        let on_save_click = on_edit_save.clone();
-                        let on_edit_open = on_edit_click.clone();
-
-                        html! {
-                            <div class="msg-container" style={get_bubble_style(&msg.role)}>
-                                <strong>{ format!("{}: ", msg.role.to_uppercase()) }</strong>
-
-                                if is_editing {
-                                    <div style="margin-top: 5px;">
-                                        <textarea
-                                            value={(*edit_buffer).clone()}
-                                            oninput={on_edit_input.clone()}
-                                            style="width: 100%; height: 80px; padding: 5px; box-sizing: border-box; font-family: sans-serif; display: block;"
-                                        />
-                                        <div style="margin-top: 5px; display: flex; gap: 5px; justify-content: flex-end;">
-                                            <button
-                                                onclick={on_edit_cancel.clone()}
-                                                style="padding: 3px 8px; cursor: pointer;"
-                                            >
-                                                { "Cancel" }
-                                            </button>
-                                            <button
-                                                onclick={Callback::from(move |_| on_save_click.emit(idx))}
-                                                style="padding: 3px 8px; cursor: pointer; background-color: #4caf50; color: white; border: none; border-radius: 3px;"
-                                            >
-                                                { "Save & Branch" }
-                                            </button>
-                                        </div>
-                                    </div>
-                                } else {
-                                    { render_markdown(&msg.content) }
-
-                                    if is_user && !(*is_loading) {
-                                        <div class="msg-actions" style="text-align: right;">
-                                            <button class="btn-edit" onclick={Callback::from(move |_| on_edit_open.emit(idx))}>
-                                                { "✏ Edit" }
-                                            </button>
-                                        </div>
-                                    }
-                                }
-                            </div>
-                        }
-                    })
-                }
-                if *is_loading && !*stream_enabled { <div style="color: gray; font-style: italic; margin-left: 10px;">{ "Thinking..." }</div> }
-            </div>
-
-            <form onsubmit={on_submit_click} style="display: flex; flex-direction: column;">
-                <div style="display: flex; gap: 10px; align-items: flex-start;">
-                    <textarea
-                        value={(*input_text).clone()}
-                        oninput={on_input_text}
-                        onkeydown={on_keydown}
-                        disabled={*is_loading}
-                        style="flex-grow: 1; padding: 10px; height: 50px; font-family: sans-serif;"
-                        placeholder="Type a message... (Shift+Enter for new line)"
-                    />
-                    if *is_loading {
-                        <button type="button" onclick={on_stop} style="height: 50px; padding: 0 20px; background-color: #ffcdd2; border: 1px solid #e57373; cursor: pointer;">
-                            { "Stop" }
-                        </button>
-                    } else {
-                        <button type="submit" style="height: 50px; padding: 0 20px; cursor: pointer;">
-                            { "Send" }
-                        </button>
+                            html! {
+                                <div
+                                    class={format!("chat-item {}", active_class)}
+                                    onclick={Callback::from(move |_| on_select.emit(id_for_select.clone()))}
+                                >
+                                    <span style="overflow: hidden; text-overflow: ellipsis;">{ &chat.title }</span>
+                                    <button
+                                        class="del-btn"
+                                        onclick={Callback::from(move |e: MouseEvent| on_del.emit((e, id_for_delete.clone())))}
+                                        title="Delete Chat"
+                                    >
+                                        { "×" }
+                                    </button>
+                                </div>
+                            }
+                        })
                     }
                 </div>
-            </form>
+            </div>
+
+            <div style={main_style}>
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #ddd; background: white;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <button class="btn-icon" onclick={on_toggle_sidebar} title="Toggle Sidebar">{ "☰" }</button>
+                        <h2 style="margin: 0; font-size: 1.2rem;">{ "Local LLM" }</h2>
+                    </div>
+                    <button class="btn-icon" onclick={on_toggle_settings}>{ "⚙" }</button>
+                </div>
+
+                if *show_settings {
+                    <div style="position: absolute; top: 50px; right: 10px; width: 300px; background: white; border: 1px solid #ccc; box-shadow: 0 4px 10px rgba(0,0,0,0.1); padding: 15px; border-radius: 8px; z-index: 100;">
+                        <h3>{ "Configuration" }</h3>
+                        <label style="display: block; font-size: 0.9em; margin-bottom: 5px;">{ "System Prompt:" }</label>
+                        <textarea value={(*system_prompt).clone()} oninput={on_system_prompt_change} style="width: 100%; height: 60px; margin-bottom: 10px;" />
+
+                        <label style="display: block; font-size: 0.9em; margin-bottom: 5px;">{ "Server URL:" }</label>
+                        <div style="display: flex; gap: 5px; margin-bottom: 10px;">
+                            <input type="text" value={(*base_url).clone()} oninput={on_url_change} style="flex-grow: 1;" />
+                            <button onclick={on_fetch_models}>{ "⟳" }</button>
+                        </div>
+
+                        <label style="display: block; font-size: 0.9em; margin-bottom: 5px;">{ "Model:" }</label>
+                        <select onchange={on_model_select} style="width: 100%; margin-bottom: 10px;">
+                            {
+                                if available_models.is_empty() { html! { <option value="default">{ "Default" }</option> } }
+                                else { html! { for available_models.iter().map(|m| { let sel = m == &*selected_model; html! { <option value={m.clone()} selected={sel}>{ m }</option> } }) } }
+                            }
+                        </select>
+                        <label style="display: flex; gap: 5px; align-items: center; margin-bottom: 15px;">
+                            <input type="checkbox" checked={*stream_enabled} onchange={on_stream_change} />
+                            { "Stream Responses" }
+                        </label>
+                        <hr />
+                        <div style="display: flex; flex-direction: column; gap: 5px; margin-top: 10px;">
+                            <button onclick={on_clear_all_chats} style="background: #ffebee; color: #c62828; border: 1px solid #c62828; padding: 5px; border-radius: 4px; cursor: pointer;">{ "Delete All Chats" }</button>
+                            <button onclick={on_reset_settings} style="background: #fff; border: 1px solid #ccc; padding: 5px; border-radius: 4px; cursor: pointer;">{ "Reset Settings" }</button>
+                        </div>
+                        if !settings_error.is_empty() { <div style="color: red; font-size: 0.8em; margin-top: 5px;">{ &*settings_error }</div> }
+                    </div>
+                }
+
+                <div class="chat-scroll-container" style="flex-grow: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 15px;" ref={chat_container_ref} onscroll={on_scroll_chat}>
+                    {
+                        for current_messages.iter().enumerate().map(|(idx, msg)| {
+                            let is_user = msg.role == "user";
+                            let is_editing = *editing_index == Some(idx);
+                            let on_save = on_edit_save.clone();
+                            let on_cancel = on_edit_cancel.clone();
+                            let on_open = on_edit_click.clone();
+
+                            html! {
+                                <div class="msg-container" style={get_bubble_style(&msg.role)}>
+                                    <div style="font-weight: bold; font-size: 0.8em; opacity: 0.7; margin-bottom: 5px;">{ msg.role.to_uppercase() }</div>
+                                    if is_editing {
+                                        <textarea value={(*edit_buffer).clone()} oninput={on_edit_input.clone()} style="width: 100%; height: 100px; display: block;" />
+                                        <div style="margin-top: 5px; text-align: right;">
+                                            <button onclick={on_cancel} style="margin-right: 5px;">{"Cancel"}</button>
+                                            <button onclick={Callback::from(move |_| on_save.emit(idx))} style="background: #4caf50; color: white; border: none; padding: 5px 10px;">{"Save"}</button>
+                                        </div>
+                                    } else {
+                                        { render_markdown(&msg.content) }
+                                        if is_user && !*is_loading {
+                                            <div style="text-align: right; margin-top: 5px;">
+                                                <button class="btn-edit" style="color: #666; cursor: pointer; border: none; background: none; font-size: 0.8em; text-decoration: underline;" onclick={Callback::from(move |_| on_open.emit(idx))}>{"Edit"}</button>
+                                            </div>
+                                        }
+                                    }
+                                </div>
+                            }
+                        })
+                    }
+                    if *is_loading && !*stream_enabled {
+                        <div style="color: #888; font-style: italic; margin-left: 20px;">{ "Thinking..." }</div>
+                    }
+                </div>
+
+                <div style="padding: 20px; background: white; border-top: 1px solid #eee;">
+                    <form onsubmit={on_submit_click} style="display: flex; gap: 10px;">
+                        <textarea
+                            value={(*input_text).clone()}
+                            oninput={on_input_text}
+                            onkeydown={on_keydown}
+                            disabled={*is_loading}
+                            style="flex-grow: 1; padding: 10px; height: 50px; font-family: sans-serif; border: 1px solid #ccc; border-radius: 4px;"
+                            placeholder="Type a message..."
+                        />
+                        if *is_loading {
+                            <button type="button" onclick={on_stop} style="padding: 0 20px; background-color: #ffcdd2; color: #c62828; border: 1px solid #ef5350; border-radius: 4px; cursor: pointer;">{ "Stop" }</button>
+                        } else {
+                            <button type="submit" style="padding: 0 20px; background-color: #2196f3; color: white; border: none; border-radius: 4px; cursor: pointer;">{ "Send" }</button>
+                        }
+                    </form>
+                </div>
+            </div>
         </div>
     }
 }
