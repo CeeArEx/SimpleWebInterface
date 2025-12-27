@@ -1,5 +1,6 @@
 // cargo: dep = "yew"
 // cargo: dep = "serde"
+// cargo: dep = "serde_json"
 // cargo: dep = "reqwest"
 // cargo: dep = "pulldown-cmark"
 // cargo: dep = "futures-util"
@@ -10,13 +11,13 @@ use yew::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{HtmlSelectElement, HtmlElement, HtmlTextAreaElement, Event};
+use web_sys::{HtmlSelectElement, HtmlElement, HtmlTextAreaElement, Event, HtmlInputElement};
 use pulldown_cmark::{Parser, Options, html, Event as MdEvent};
 use futures_util::StreamExt;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 // -----------------------------------------------------------------------------
-// Data Models
+// Data Models (Same as before)
 // -----------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -75,7 +76,6 @@ fn render_markdown(text: &str) -> Html {
 
     let parser = Parser::new_ext(text, options)
         .map(|event| match event {
-            // Map the "SoftBreak" (newline) to a "HardBreak" (<br>)
             MdEvent::SoftBreak => MdEvent::HardBreak,
             _ => event,
         });
@@ -105,8 +105,12 @@ pub fn app() -> Html {
     ]);
 
     let input_text = use_state(|| String::new());
-    let is_loading = use_state(|| false);
 
+    // Editing state
+    let editing_index = use_state(|| None::<usize>);
+    let edit_buffer = use_state(|| String::new());
+
+    let is_loading = use_state(|| false);
     let cancellation_token = use_state(|| Arc::new(AtomicBool::new(false)));
 
     // Settings
@@ -125,7 +129,6 @@ pub fn app() -> Html {
     {
         let chat_container_ref = chat_container_ref.clone();
         let should_auto_scroll = should_auto_scroll.clone();
-
         use_effect_with(messages.clone(), move |_| {
             if *should_auto_scroll {
                 if let Some(div) = chat_container_ref.cast::<HtmlElement>() {
@@ -135,36 +138,21 @@ pub fn app() -> Html {
         });
     }
 
-    // --- CORE LOGIC: SEND MESSAGE ---
-    // Defined as a reusable callback so it can be called by Button OR Keypress
-    let perform_send = {
-        let messages = messages.clone();
-        let input_text = input_text.clone();
+    // --- LOGIC: CHAT COMPLETION ---
+    let run_chat_completion = {
+        let messages_state = messages.clone();
         let is_loading = is_loading.clone();
         let base_url = base_url.clone();
         let selected_model = selected_model.clone();
         let stream_enabled = stream_enabled.clone();
         let cancellation_token = cancellation_token.clone();
-        let should_auto_scroll = should_auto_scroll.clone();
 
-        Callback::from(move |_: ()| {
-            // Basic validation
-            if input_text.is_empty() || *is_loading { return; }
-
-            cancellation_token.store(false, Ordering::Relaxed);
-            should_auto_scroll.set(true);
-
-            // 1. Add User Message
-            let mut current_history = (*messages).clone();
-            current_history.push(Message { role: "user".into(), content: (*input_text).clone() });
-            messages.set(current_history.clone());
-
-            // 2. Clear Input & Set Loading
-            input_text.set(String::new());
+        Callback::from(move |history_to_send: Vec<Message>| {
             is_loading.set(true);
+            cancellation_token.store(false, Ordering::Relaxed);
+            messages_state.set(history_to_send.clone());
 
-            // 3. Prepare Async Task
-            let messages_state = messages.clone();
+            let messages_state = messages_state.clone();
             let is_loading_state = is_loading.clone();
             let clean_url = base_url.trim_end_matches('/').to_string();
             let model_id = (*selected_model).clone();
@@ -174,7 +162,7 @@ pub fn app() -> Html {
             spawn_local(async move {
                 let client = reqwest::Client::new();
                 let request_body = ChatRequest {
-                    messages: current_history.clone(),
+                    messages: history_to_send.clone(),
                     model: model_id,
                     temperature: 0.7,
                     stream: is_stream,
@@ -188,8 +176,7 @@ pub fn app() -> Html {
                 match response_result {
                     Ok(response) => {
                         if is_stream {
-                            // Streaming Logic
-                            let mut stream_history = current_history.clone();
+                            let mut stream_history = history_to_send.clone();
                             stream_history.push(Message { role: "assistant".into(), content: "".into() });
                             messages_state.set(stream_history.clone());
 
@@ -198,7 +185,6 @@ pub fn app() -> Html {
 
                             while let Some(item) = stream.next().await {
                                 if cancel_flag.load(Ordering::Relaxed) { break; }
-
                                 if let Ok(chunk_bytes) = item {
                                     let chunk_str = String::from_utf8_lossy(&chunk_bytes);
                                     buffer.push_str(&chunk_str);
@@ -206,7 +192,6 @@ pub fn app() -> Html {
                                     while let Some(pos) = buffer.find('\n') {
                                         let line = buffer[..pos].to_string();
                                         buffer.drain(..pos + 1);
-
                                         let trimmed = line.trim();
                                         if trimmed.starts_with("data: ") {
                                             let json_str = &trimmed[6..];
@@ -226,11 +211,10 @@ pub fn app() -> Html {
                                 }
                             }
                         } else {
-                            // Standard Logic
                             if let Ok(json) = response.json::<ChatResponse>().await {
                                 if !cancel_flag.load(Ordering::Relaxed) {
                                     if let Some(choice) = json.choices.first() {
-                                        let mut new_hist = current_history;
+                                        let mut new_hist = history_to_send;
                                         new_hist.push(choice.message.clone());
                                         messages_state.set(new_hist);
                                     }
@@ -240,11 +224,8 @@ pub fn app() -> Html {
                     }
                     Err(e) => {
                         if !cancel_flag.load(Ordering::Relaxed) {
-                            let mut error_hist = current_history;
-                            error_hist.push(Message {
-                                role: "system".into(),
-                                content: format!("Error: {}", e)
-                            });
+                            let mut error_hist = history_to_send;
+                            error_hist.push(Message { role: "system".into(), content: format!("Error: {}", e) });
                             messages_state.set(error_hist);
                         }
                     }
@@ -254,34 +235,94 @@ pub fn app() -> Html {
         })
     };
 
-    // --- EVENT HANDLERS ---
+    // --- HANDLERS ---
 
-    // 1. On Submit Button Click
-    let on_submit_click = {
-        let perform_send = perform_send.clone();
-        Callback::from(move |e: SubmitEvent| {
-            e.prevent_default(); // Prevent form reload
-            perform_send.emit(());
+    // Send New Message
+    let perform_send = {
+        let messages = messages.clone();
+        let input_text = input_text.clone();
+        let is_loading = is_loading.clone();
+        let should_auto_scroll = should_auto_scroll.clone();
+        let run_chat_completion = run_chat_completion.clone();
+
+        Callback::from(move |_: ()| {
+            if input_text.is_empty() || *is_loading { return; }
+            should_auto_scroll.set(true);
+            let mut new_history = (*messages).clone();
+            new_history.push(Message { role: "user".into(), content: (*input_text).clone() });
+            input_text.set(String::new());
+            run_chat_completion.emit(new_history);
         })
     };
 
-    // 2. On Enter Key in Textarea
-    let on_keydown = {
-        let perform_send = perform_send.clone();
-        Callback::from(move |e: KeyboardEvent| {
-            // Check if Enter is pressed
-            if e.key() == "Enter" {
-                // If Shift or Ctrl is NOT pressed, send message.
-                // If Shift/Ctrl IS pressed, allow default behavior (new line).
-                if !e.shift_key() && !e.ctrl_key() {
-                    e.prevent_default(); // Prevent new line
-                    perform_send.emit(());
-                }
+    // 1. Enter Edit Mode
+    let on_edit_click = {
+        let editing_index = editing_index.clone();
+        let edit_buffer = edit_buffer.clone();
+        let messages = messages.clone();
+        Callback::from(move |idx: usize| {
+            if let Some(msg) = messages.get(idx) {
+                editing_index.set(Some(idx));
+                edit_buffer.set(msg.content.clone());
             }
         })
     };
 
-    // 3. Input Handling (Textarea)
+    // 2. Cancel Edit
+    let on_edit_cancel = {
+        let editing_index = editing_index.clone();
+        let edit_buffer = edit_buffer.clone();
+        Callback::from(move |_| {
+            editing_index.set(None);
+            edit_buffer.set(String::new());
+        })
+    };
+
+    // 3. Save Edit (Branching Logic)
+    let on_edit_save = {
+        let editing_index = editing_index.clone();
+        let edit_buffer = edit_buffer.clone();
+        let messages = messages.clone();
+        let run_chat_completion = run_chat_completion.clone();
+        let should_auto_scroll = should_auto_scroll.clone();
+
+        Callback::from(move |idx: usize| {
+            should_auto_scroll.set(true);
+            let mut branched_history = (*messages).clone();
+            if idx < branched_history.len() {
+                branched_history.truncate(idx + 1);
+            }
+            if let Some(msg) = branched_history.last_mut() {
+                msg.content = (*edit_buffer).clone();
+            }
+            editing_index.set(None);
+            edit_buffer.set(String::new());
+            run_chat_completion.emit(branched_history);
+        })
+    };
+
+    let on_edit_input = {
+        let edit_buffer = edit_buffer.clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlTextAreaElement = e.target_unchecked_into();
+            edit_buffer.set(input.value());
+        })
+    };
+
+    // Standard Inputs
+    let on_submit_click = {
+        let perform_send = perform_send.clone();
+        Callback::from(move |e: SubmitEvent| { e.prevent_default(); perform_send.emit(()); })
+    };
+    let on_keydown = {
+        let perform_send = perform_send.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" && !e.shift_key() && !e.ctrl_key() {
+                e.prevent_default();
+                perform_send.emit(());
+            }
+        })
+    };
     let on_input_text = {
         let input_text = input_text.clone();
         Callback::from(move |e: InputEvent| {
@@ -290,7 +331,7 @@ pub fn app() -> Html {
         })
     };
 
-    // ... (Existing Callbacks: Scroll, Settings, etc. - kept same) ...
+    // Settings Handlers
     let on_scroll_chat = {
         let should_auto_scroll = should_auto_scroll.clone();
         Callback::from(move |e: Event| {
@@ -312,24 +353,21 @@ pub fn app() -> Html {
             system_prompt.set(val.clone());
             let mut current_msgs = (*messages).clone();
             if let Some(first) = current_msgs.first_mut() {
-                if first.role == "system" {
-                    first.content = val;
-                    messages.set(current_msgs);
-                }
+                if first.role == "system" { first.content = val; messages.set(current_msgs); }
             }
         })
     };
     let on_url_change = {
         let base_url = base_url.clone();
         Callback::from(move |e: InputEvent| {
-            let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+            let input: HtmlInputElement = e.target_unchecked_into();
             base_url.set(input.value());
         })
     };
     let on_stream_change = {
         let stream_enabled = stream_enabled.clone();
         Callback::from(move |e: Event| {
-            let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+            let input: HtmlInputElement = e.target_unchecked_into();
             stream_enabled.set(input.checked());
         })
     };
@@ -362,14 +400,14 @@ pub fn app() -> Html {
                 settings_error.set(String::new());
                 let client = reqwest::Client::new();
                 let clean_url = base_url.trim_end_matches('/');
-                let url = format!("{}/v1/models", clean_url);
-                match client.get(&url).send().await {
+                match client.get(format!("{}/v1/models", clean_url)).send().await {
                     Ok(resp) => {
                         match resp.json::<ModelListResponse>().await {
                             Ok(json) => {
                                 let names: Vec<String> = json.data.into_iter().map(|m| m.id).collect();
-                                if names.len() == 1 { selected_model.set(names[0].clone()); }
-                                else if !names.is_empty() && !names.contains(&*selected_model) { selected_model.set(names[0].clone()); }
+                                if names.len() == 1 || (!names.is_empty() && !names.contains(&*selected_model)) {
+                                    selected_model.set(names[0].clone());
+                                }
                                 available_models.set(names);
                             }
                             Err(_) => settings_error.set("Failed to parse models JSON.".into()),
@@ -389,23 +427,22 @@ pub fn app() -> Html {
             .markdown-body pre { background: #333; color: #fff; padding: 10px; border-radius: 4px; overflow-x: auto; }
             .markdown-body code { background: #eee; padding: 2px 4px; border-radius: 2px; font-family: monospace; }
             .markdown-body pre code { background: transparent; color: inherit; }
-            .markdown-body ul, .markdown-body ol { padding-left: 20px; }
-
             .chat-scroll-container { scroll-behavior: smooth; }
-
-            /* Custom Scrollbar for Textarea */
             textarea { resize: none; overflow-y: auto; }
+            .msg-actions { opacity: 0; transition: opacity 0.2s; margin-top: 5px; font-size: 0.8em; }
+            .msg-container:hover .msg-actions { opacity: 1; }
+            .btn-edit { background: none; border: none; color: #666; cursor: pointer; text-decoration: underline; padding: 0; }
+            .btn-edit:hover { color: #000; }
             " }
         </style>
     };
 
     let container_style = "font-family: sans-serif; max_width: 800px; margin: 0 auto; padding: 20px; position: relative;";
     let chat_box_style = "border: 1px solid #ccc; padding: 10px; height: 500px; overflow-y: auto; margin-bottom: 10px; border-radius: 4px; display: flex; flex-direction: column; gap: 10px;";
-    let settings_modal_style = "position: absolute; top: 60px; right: 20px; width: 320px; background: white; border: 1px solid #aaa; box-shadow: 0 4px 8px rgba(0,0,0,0.1); padding: 15px; border-radius: 8px; z-index: 10;";
 
     let get_bubble_style = |role: &str| {
         if role == "user" {
-            "background-color: #e1f5fe; padding: 10px; text-align: right; border-radius: 10px 10px 0 10px; align-self: flex-end; max-width: 80%; box-shadow: 1px 1px 2px rgba(0,0,0,0.1);"
+            "background-color: #e1f5fe; padding: 10px; text-align: left; border-radius: 10px 10px 0 10px; align-self: flex-end; max-width: 80%; box-shadow: 1px 1px 2px rgba(0,0,0,0.1); position: relative;"
         } else if role == "system" {
             "background-color: #f8f9fa; color: #666; padding: 8px; border-radius: 8px; align-self: center; font-size: 0.85em; width: 90%; border: 1px dashed #ccc;"
         } else {
@@ -424,7 +461,7 @@ pub fn app() -> Html {
             </div>
 
             if *show_settings {
-                <div style={settings_modal_style}>
+                <div style="position: absolute; top: 60px; right: 20px; width: 320px; background: white; border: 1px solid #aaa; box-shadow: 0 4px 8px rgba(0,0,0,0.1); padding: 15px; border-radius: 8px; z-index: 10;">
                     <h3>{ "Configuration" }</h3>
                     <label style="display: block; margin-bottom: 5px; font-weight: bold;">{ "System Prompt:" }</label>
                     <textarea value={(*system_prompt).clone()} oninput={on_system_prompt_change} style="width: 100%; height: 80px; margin-bottom: 15px; padding: 5px; font-family: sans-serif; resize: vertical;" />
@@ -450,11 +487,52 @@ pub fn app() -> Html {
 
             <div class="chat-scroll-container" style={chat_box_style} ref={chat_container_ref} onscroll={on_scroll_chat}>
                 {
-                    for messages.iter().map(|msg| {
+                    for messages.iter().enumerate().map(|(idx, msg)| {
+                        let is_user = msg.role == "user";
+                        let is_editing = *editing_index == Some(idx);
+
+                        // --- FIX: CLONE CALLBACKS FOR EACH ITERATION ---
+                        let on_save_click = on_edit_save.clone();
+                        let on_edit_open = on_edit_click.clone();
+                        // -----------------------------------------------
+
                         html! {
-                            <div style={get_bubble_style(&msg.role)}>
+                            <div class="msg-container" style={get_bubble_style(&msg.role)}>
                                 <strong>{ format!("{}: ", msg.role.to_uppercase()) }</strong>
-                                { render_markdown(&msg.content) }
+
+                                if is_editing {
+                                    <div style="margin-top: 5px;">
+                                        <textarea
+                                            value={(*edit_buffer).clone()}
+                                            oninput={on_edit_input.clone()}
+                                            style="width: 100%; height: 80px; padding: 5px; box-sizing: border-box; font-family: sans-serif; display: block;"
+                                        />
+                                        <div style="margin-top: 5px; display: flex; gap: 5px; justify-content: flex-end;">
+                                            <button
+                                                onclick={on_edit_cancel.clone()}
+                                                style="padding: 3px 8px; cursor: pointer;"
+                                            >
+                                                { "Cancel" }
+                                            </button>
+                                            <button
+                                                onclick={Callback::from(move |_| on_save_click.emit(idx))}
+                                                style="padding: 3px 8px; cursor: pointer; background-color: #4caf50; color: white; border: none; border-radius: 3px;"
+                                            >
+                                                { "Save & Branch" }
+                                            </button>
+                                        </div>
+                                    </div>
+                                } else {
+                                    { render_markdown(&msg.content) }
+
+                                    if is_user && !(*is_loading) {
+                                        <div class="msg-actions" style="text-align: right;">
+                                            <button class="btn-edit" onclick={Callback::from(move |_| on_edit_open.emit(idx))}>
+                                                { "✏ Edit" }
+                                            </button>
+                                        </div>
+                                    }
+                                }
                             </div>
                         }
                     })
@@ -462,18 +540,16 @@ pub fn app() -> Html {
                 if *is_loading && !*stream_enabled { <div style="color: gray; font-style: italic; margin-left: 10px;">{ "Thinking..." }</div> }
             </div>
 
-            // --- CHANGED: Input Area ---
             <form onsubmit={on_submit_click} style="display: flex; flex-direction: column;">
                 <div style="display: flex; gap: 10px; align-items: flex-start;">
                     <textarea
                         value={(*input_text).clone()}
                         oninput={on_input_text}
-                        onkeydown={on_keydown} // Attach Key Handler
+                        onkeydown={on_keydown}
                         disabled={*is_loading}
                         style="flex-grow: 1; padding: 10px; height: 50px; font-family: sans-serif;"
                         placeholder="Type a message... (Shift+Enter for new line)"
                     />
-
                     if *is_loading {
                         <button type="button" onclick={on_stop} style="height: 50px; padding: 0 20px; background-color: #ffcdd2; border: 1px solid #e57373; cursor: pointer;">
                             { "Stop" }
@@ -483,10 +559,6 @@ pub fn app() -> Html {
                             { "Send" }
                         </button>
                     }
-                </div>
-                <div style="font-size: 0.8em; color: #666; margin-top: 5px; text-align: right;">
-                    { "Model: " } <strong>{ &*selected_model }</strong>
-                    { if *stream_enabled { " (Streaming)" } else { "" } }
                 </div>
             </form>
         </div>
