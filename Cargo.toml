@@ -1,0 +1,31 @@
+[package]
+name = "SimpleWebInterface"
+version = "0.1.0"
+authors = ["CeeArEx <christian.rute@web.de>"]
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2.92"
+wasm-bindgen-futures = "0.4.42"
+yew = { version = "0.21", features = ["csr"] }
+reqwest = { version = "0.11", features = ["json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+console_error_panic_hook = "0.1.7"
+pulldown-cmark = "0.9"
+futures-util = "0.3"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "HtmlSelectElement",
+    "HtmlElement", # NEW: For scroll operations
+    "Element",     # NEW: For scrollHeight/scrollTop
+    "KeyboardEvent",
+    "console",
+]
