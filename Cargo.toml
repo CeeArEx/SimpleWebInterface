@@ -20,6 +20,8 @@ wasm-bindgen-futures = "0.4"
 # FIX 2: "js" feature required for WASM
 uuid = { version = "1.0", features = ["v4", "js"] }
 js-sys = "0.3"
+anyhow = "1.0.100"
+console_error_panic_hook = "0.1.7"
 
 [dependencies.web-sys]
 version = "0.3"
