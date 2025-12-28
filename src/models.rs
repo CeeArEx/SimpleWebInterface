@@ -30,11 +30,20 @@ impl ChatSession {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct SavedPrompt {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AppSettings {
     pub system_prompt: String,
     pub base_url: String,
     pub selected_model: String,
     pub stream_enabled: bool,
+    #[serde(default)] // Ensures backward compatibility with existing localStorage data
+    pub saved_prompts: Vec<SavedPrompt>,
 }
 
 impl Default for AppSettings {
@@ -44,11 +53,12 @@ impl Default for AppSettings {
             base_url: "http://localhost:8080".to_string(),
             selected_model: "default".to_string(),
             stream_enabled: true,
+            saved_prompts: Vec::new(),
         }
     }
 }
 
-// API DTOs
+// API DTOs (Unchanged)
 #[derive(Serialize, Debug)]
 pub struct ChatRequest {
     pub messages: Vec<Message>,

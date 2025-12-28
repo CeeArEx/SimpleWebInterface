@@ -10,7 +10,6 @@ use crate::components::{sidebar::Sidebar, settings::SettingsModal, chat_area::Ch
 const KEY_CHATS: &str = "llm_chats_v2";
 const KEY_SETTINGS: &str = "chat_settings_v1";
 
-// --- CSS STYLES ---
 const GLOBAL_STYLES: &str = r#"
     :root {
         --bg-app: #ffffff;
@@ -20,7 +19,7 @@ const GLOBAL_STYLES: &str = r#"
         --border-color: #e5e5e5;
         --text-primary: #333;
         --text-secondary: #666;
-        --accent-color: #10a37f; /* ChatGPT Green */
+        --accent-color: #10a37f;
         --accent-hover: #1a7f64;
         --danger-color: #ef4444;
     }
@@ -28,13 +27,11 @@ const GLOBAL_STYLES: &str = r#"
     * { box-sizing: border-box; }
     body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: var(--text-primary); }
 
-    /* Layout */
     .app-container { display: flex; height: 100vh; overflow: hidden; }
     .main-content { flex-grow: 1; display: flex; flex-direction: column; position: relative; background: var(--bg-app); }
     .header { padding: 10px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; height: 60px; }
     .header h2 { font-size: 1rem; margin: 0; font-weight: 600; }
 
-    /* Buttons */
     .btn { cursor: pointer; border: 1px solid var(--border-color); background: white; padding: 8px 12px; border-radius: 6px; font-size: 0.9rem; transition: all 0.2s; color: var(--text-primary); }
     .btn:hover { background: #f0f0f0; }
     .btn-primary { background: var(--accent-color); color: white; border-color: transparent; }
@@ -44,11 +41,9 @@ const GLOBAL_STYLES: &str = r#"
     .btn-icon { border: none; background: transparent; font-size: 1.2rem; padding: 5px; color: var(--text-secondary); }
     .btn-icon:hover { background: rgba(0,0,0,0.05); color: var(--text-primary); }
 
-    /* Inputs */
     .form-input, .form-select, .form-textarea { width: 100%; padding: 8px; border: 1px solid var(--border-color); border-radius: 6px; font-family: inherit; margin-bottom: 10px; }
     .form-input:focus, .form-textarea:focus { outline: 2px solid var(--accent-color); border-color: transparent; }
 
-    /* Markdown */
     .markdown-body { line-height: 1.6; font-size: 1rem; }
     .markdown-body pre { background: #2d2d2d; color: #fff; padding: 15px; border-radius: 6px; overflow-x: auto; }
     .markdown-body code { background: #f4f4f4; padding: 2px 4px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }
@@ -58,7 +53,6 @@ const GLOBAL_STYLES: &str = r#"
 
 #[function_component(App)]
 pub fn app() -> Html {
-    // --- STATE SETUP (Same as before) ---
     let settings = use_state(|| LocalStorage::get::<AppSettings>(KEY_SETTINGS).unwrap_or_default());
     let chats = use_state(|| LocalStorage::get::<Vec<ChatSession>>(KEY_CHATS).unwrap_or_else(|| {
         vec![ChatSession::new("You are a helpful assistant".to_string())]
@@ -73,7 +67,7 @@ pub fn app() -> Html {
     let current_chat = chats.iter().find(|c| c.id == *active_chat_id);
     let current_messages = current_chat.map(|c| c.messages.clone()).unwrap_or_default();
 
-    // --- EFFECTS & HANDLERS (Same logic, compacted for brevity) ---
+    // --- EFFECTS ---
     {
         let chats = chats.clone();
         use_effect_with(chats, |c| LocalStorage::set(KEY_CHATS, &**c));
@@ -83,16 +77,54 @@ pub fn app() -> Html {
         use_effect_with(s, |s| LocalStorage::set(KEY_SETTINGS, &**s));
     }
 
+    // --- ACTIONS ---
+
     let on_new_chat = {
         let chats = chats.clone();
-        let active = active_chat_id.clone();
+        let active_id = active_chat_id.clone();
         let sys = settings.system_prompt.clone();
         Callback::from(move |_| {
+            let current_id = (*active_id).clone();
+            let mut current_list = (*chats).clone();
+
+            let current_is_empty = if let Some(curr) = current_list.iter().find(|c| c.id == current_id) {
+                curr.messages.len() == 1 && curr.messages[0].role == "system"
+            } else {
+                false
+            };
+
+            if current_is_empty {
+                return;
+            }
+
             let new_chat = ChatSession::new(sys.clone());
-            let mut curr = (*chats).clone();
-            curr.insert(0, new_chat.clone());
-            chats.set(curr);
-            active.set(new_chat.id);
+            current_list.insert(0, new_chat.clone());
+            chats.set(current_list);
+            active_id.set(new_chat.id);
+        })
+    };
+
+    let on_select_chat = {
+        let chats = chats.clone();
+        let active_id = active_chat_id.clone();
+        Callback::from(move |target_id: String| {
+            let current_id = (*active_id).clone();
+            if current_id == target_id { return; }
+
+            let mut list = (*chats).clone();
+
+            let should_delete_prev = if let Some(prev) = list.iter().find(|c| c.id == current_id) {
+                prev.messages.len() == 1 && prev.messages[0].role == "system"
+            } else {
+                false
+            };
+
+            if should_delete_prev {
+                list.retain(|c| c.id != current_id);
+            }
+
+            chats.set(list);
+            active_id.set(target_id);
         })
     };
 
@@ -103,6 +135,43 @@ pub fn app() -> Html {
             let mut curr = (*chats).clone();
             curr.retain(|c| c.id != id);
             chats.set(curr);
+        })
+    };
+
+    // --- UPDATED: Settings Save to accept AppSettings object ---
+    let on_settings_save = {
+        let s = settings.clone();
+        let chats = chats.clone();
+        let active = active_chat_id.clone();
+
+        Callback::from(move |new_settings: AppSettings| {
+            let prompt_changed = new_settings.system_prompt != s.system_prompt;
+
+            // Update main state directly
+            s.set(new_settings.clone());
+
+            // Handle Chat History updates based on prompt change
+            if prompt_changed {
+                let current_id = (*active).clone();
+                let mut list = (*chats).clone();
+
+                let mut handled = false;
+                if let Some(curr) = list.iter_mut().find(|c| c.id == current_id) {
+                    if curr.messages.len() == 1 && curr.messages[0].role == "system" {
+                        curr.messages[0].content = new_settings.system_prompt.clone();
+                        handled = true;
+                    }
+                }
+
+                if handled {
+                    chats.set(list);
+                } else {
+                    let new_chat = ChatSession::new(new_settings.system_prompt);
+                    list.insert(0, new_chat.clone());
+                    chats.set(list);
+                    active.set(new_chat.id);
+                }
+            }
         })
     };
 
@@ -144,6 +213,16 @@ pub fn app() -> Html {
                     if let Some(c) = all.iter_mut().find(|c| c.id == cid) { c.messages = msgs; }
                     chats_state.set(all);
                 };
+
+                if history.len() == 2 {
+                    if let Ok(title) = LlmService::generate_title(&set.base_url, &set.selected_model, &history).await {
+                        let mut all = (*chats_state).clone();
+                        if let Some(c) = all.iter_mut().find(|c| c.id == cid) {
+                            c.title = title;
+                        }
+                        chats_state.set(all);
+                    }
+                }
 
                 if let Ok(resp) = LlmService::chat_completion_request(&set.base_url, &req).await {
                     if set.stream_enabled {
@@ -192,43 +271,6 @@ pub fn app() -> Html {
         })
     };
 
-    let on_settings_save = {
-        let s = settings.clone();
-        // Capture chats and active_chat_id to allow creating a new chat
-        let chats = chats.clone();
-        let active = active_chat_id.clone();
-
-        Callback::from(move |(new_sys, url, model, stream): (String, String, String, bool)| {
-            // 1. Check if the system prompt has actually changed
-            let prompt_changed = new_sys != s.system_prompt;
-
-            // 2. Update Settings
-            s.set(AppSettings {
-                system_prompt: new_sys.clone(), // Use the new value
-                base_url: url,
-                selected_model: model,
-                stream_enabled: stream
-            });
-
-            // 3. If prompt changed, trigger New Chat logic
-            if prompt_changed {
-                let new_chat = ChatSession::new(new_sys);
-                let mut curr = (*chats).clone();
-                // Add to top
-                curr.insert(0, new_chat.clone());
-                chats.set(curr);
-                // Switch to it
-                active.set(new_chat.id);
-            }
-        })
-    };
-
-    let close_settings = {
-        let show_settings = show_settings.clone();
-        Callback::from(move |_| show_settings.set(false))
-    };
-
-    // 1. Logic to Reset Settings
     let on_reset_settings = {
         let settings = settings.clone();
         Callback::from(move |_| {
@@ -238,19 +280,22 @@ pub fn app() -> Html {
         })
     };
 
-    // 2. Logic to Clear All Chats
     let on_clear_all_chats = {
         let chats = chats.clone();
         let active_chat_id = active_chat_id.clone();
         let settings = settings.clone();
         Callback::from(move |_| {
             if web_sys::window().unwrap().confirm_with_message("Irreversibly delete ALL chat history?").unwrap_or(false) {
-                // We must create at least one new empty chat
                 let new_chat = ChatSession::new(settings.system_prompt.clone());
                 chats.set(vec![new_chat.clone()]);
                 active_chat_id.set(new_chat.id);
             }
         })
+    };
+
+    let close_settings = {
+        let show_settings = show_settings.clone();
+        Callback::from(move |_| show_settings.set(false))
     };
 
     let toggle_settings = show_settings.clone();
@@ -264,7 +309,7 @@ pub fn app() -> Html {
                     open={*sidebar_open}
                     chats={(*chats).clone()}
                     active_chat_id={(*active_chat_id).clone()}
-                    on_select={Callback::from(move |id| active_chat_id.set(id))}
+                    on_select={on_select_chat}
                     on_new={on_new_chat}
                     on_delete={on_delete_chat}
                 />
@@ -284,11 +329,8 @@ pub fn app() -> Html {
 
                     if *show_settings {
                         <SettingsModal
-                            system_prompt={settings.system_prompt.clone()}
-                            base_url={settings.base_url.clone()}
-                            selected_model={settings.selected_model.clone()}
-                            stream_enabled={settings.stream_enabled}
-                            on_save={on_settings_save}
+                            settings={(*settings).clone()} // Pass full object
+                            on_save={on_settings_save}    // Pass full object handler
                             on_close={close_settings}
                             on_reset={on_reset_settings}
                             on_clear_chats={on_clear_all_chats}
