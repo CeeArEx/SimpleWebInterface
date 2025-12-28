@@ -30,7 +30,7 @@ const GLOBAL_STYLES: &str = r#"
     .app-container { display: flex; height: 100vh; overflow: hidden; }
     .main-content { flex-grow: 1; display: flex; flex-direction: column; position: relative; background: var(--bg-app); }
     .header { padding: 10px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; height: 60px; }
-    .header h2 { font-size: 1rem; margin: 0; font-weight: 600; }
+    .header h2 { font-size: 1rem; margin: 0; font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; max-width: 500px; }
 
     .btn { cursor: pointer; border: 1px solid var(--border-color); background: white; padding: 8px 12px; border-radius: 6px; font-size: 0.9rem; transition: all 0.2s; color: var(--text-primary); }
     .btn:hover { background: #f0f0f0; }
@@ -112,7 +112,6 @@ pub fn app() -> Html {
             if current_id == target_id { return; }
 
             let mut list = (*chats).clone();
-
             let should_delete_prev = if let Some(prev) = list.iter().find(|c| c.id == current_id) {
                 prev.messages.len() == 1 && prev.messages[0].role == "system"
             } else {
@@ -138,7 +137,6 @@ pub fn app() -> Html {
         })
     };
 
-    // --- UPDATED: Settings Save to accept AppSettings object ---
     let on_settings_save = {
         let s = settings.clone();
         let chats = chats.clone();
@@ -146,15 +144,11 @@ pub fn app() -> Html {
 
         Callback::from(move |new_settings: AppSettings| {
             let prompt_changed = new_settings.system_prompt != s.system_prompt;
-
-            // Update main state directly
             s.set(new_settings.clone());
 
-            // Handle Chat History updates based on prompt change
             if prompt_changed {
                 let current_id = (*active).clone();
                 let mut list = (*chats).clone();
-
                 let mut handled = false;
                 if let Some(curr) = list.iter_mut().find(|c| c.id == current_id) {
                     if curr.messages.len() == 1 && curr.messages[0].role == "system" {
@@ -162,7 +156,6 @@ pub fn app() -> Html {
                         handled = true;
                     }
                 }
-
                 if handled {
                     chats.set(list);
                 } else {
@@ -175,6 +168,7 @@ pub fn app() -> Html {
         })
     };
 
+    // --- MAIN CHAT LOGIC ---
     let run_chat = {
         let chats = chats.clone();
         let active_id = active_chat_id.clone();
@@ -188,17 +182,34 @@ pub fn app() -> Html {
             token.store(false, Ordering::Relaxed);
 
             let mut history = chats.iter().find(|c| c.id == current_id).map(|c| c.messages.clone()).unwrap_or_default();
-            history.push(Message { role: "user".into(), content: msg_content });
+            history.push(Message { role: "user".into(), content: msg_content.clone() });
 
+            // 1. Calculate Title if needed
+            let mut new_title_opt = None;
+            if history.len() == 2 {
+                let first_line = msg_content.lines().next().unwrap_or("New Chat");
+                let mut t: String = first_line.chars().take(40).collect();
+                if first_line.chars().count() > 40 { t.push_str("..."); }
+                new_title_opt = Some(t);
+            }
+
+            // 2. Update Immediate UI (so user sees it instantly)
             let mut all_chats = (*chats).clone();
-            if let Some(c) = all_chats.iter_mut().find(|c| c.id == current_id) { c.messages = history.clone(); }
+            if let Some(c) = all_chats.iter_mut().find(|c| c.id == current_id) {
+                if let Some(t) = &new_title_opt {
+                    c.title = t.clone();
+                }
+                c.messages = history.clone();
+            }
             chats.set(all_chats);
 
+            // 3. Prepare for Async
             let chats_state = chats.clone();
             let loading_state = loading.clone();
             let set = settings.clone();
             let cancel = token.clone();
             let cid = current_id.clone();
+            let title_override = new_title_opt.clone(); // <--- Pass the new title into the async block
 
             spawn_local(async move {
                 let req = ChatRequest {
@@ -208,21 +219,18 @@ pub fn app() -> Html {
                     stream: set.stream_enabled,
                 };
 
-                let update = |msgs: Vec<Message>| {
-                    let mut all = (*chats_state).clone();
-                    if let Some(c) = all.iter_mut().find(|c| c.id == cid) { c.messages = msgs; }
+                // Define update closure that preserves the title
+                let update = move |msgs: Vec<Message>| {
+                    let mut all = (*chats_state).clone(); // <--- This handle might still hold the old "New Chat" title
+                    if let Some(c) = all.iter_mut().find(|c| c.id == cid) {
+                        c.messages = msgs;
+                        // FORCE the title back if we changed it in this session
+                        if let Some(t) = &title_override {
+                            c.title = t.clone();
+                        }
+                    }
                     chats_state.set(all);
                 };
-
-                if history.len() == 2 {
-                    if let Ok(title) = LlmService::generate_title(&set.base_url, &set.selected_model, &history).await {
-                        let mut all = (*chats_state).clone();
-                        if let Some(c) = all.iter_mut().find(|c| c.id == cid) {
-                            c.title = title;
-                        }
-                        chats_state.set(all);
-                    }
-                }
 
                 if let Ok(resp) = LlmService::chat_completion_request(&set.base_url, &req).await {
                     if set.stream_enabled {
@@ -261,6 +269,7 @@ pub fn app() -> Html {
             });
         })
     };
+    // -------------------------
 
     let on_stop = {
         let token = cancellation_token.clone();
@@ -316,7 +325,7 @@ pub fn app() -> Html {
 
                 <div class="main-content">
                     <div class="header">
-                        <div style="display: flex; gap: 10px; align-items: center;">
+                        <div style="display: flex; gap: 10px; align-items: center; min-width: 0;">
                             <button class="btn-icon" onclick={Callback::from(move |_| toggle_sidebar.set(!*toggle_sidebar))} title="Toggle Menu">
                                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
                             </button>
@@ -329,8 +338,8 @@ pub fn app() -> Html {
 
                     if *show_settings {
                         <SettingsModal
-                            settings={(*settings).clone()} // Pass full object
-                            on_save={on_settings_save}    // Pass full object handler
+                            settings={(*settings).clone()}
+                            on_save={on_settings_save}
                             on_close={close_settings}
                             on_reset={on_reset_settings}
                             on_clear_chats={on_clear_all_chats}

@@ -15,26 +15,54 @@ pub struct ChatAreaProps {
 pub fn chat_area(props: &ChatAreaProps) -> Html {
     let input_text = use_state(String::new);
     let scroll_ref = use_node_ref();
+    // NEW: Track if the user is currently at the bottom of the chat
+    let is_at_bottom = use_state(|| true);
 
     // Auto-scroll effect
     {
         let div_ref = scroll_ref.clone();
+        let is_at_bottom_val = *is_at_bottom;
+
+        let last_len = props.messages.last().map(|m| m.content.len()).unwrap_or(0);
         let len = props.messages.len();
-        use_effect_with(len, move |_| {
-            if let Some(div) = div_ref.cast::<HtmlElement>() {
-                div.set_scroll_top(div.scroll_height());
+
+        use_effect_with((len, last_len), move |_| {
+            // Only auto-scroll if the user hasn't manually scrolled up
+            if is_at_bottom_val {
+                if let Some(div) = div_ref.cast::<HtmlElement>() {
+                    div.set_scroll_top(div.scroll_height());
+                }
             }
         });
     }
 
+    // NEW: Scroll Event Handler
+    let on_scroll = {
+        let is_at_bottom = is_at_bottom.clone();
+        Callback::from(move |e: Event| {
+            let div: HtmlElement = e.target_unchecked_into();
+            // Calculate if we are close to the bottom (within 25px tolerance)
+            let distance_from_bottom = div.scroll_height() - div.scroll_top() - div.client_height();
+            let currently_at_bottom = distance_from_bottom < 35;
+
+            // Only update state if it changed to prevent unnecessary re-renders
+            if *is_at_bottom != currently_at_bottom {
+                is_at_bottom.set(currently_at_bottom);
+            }
+        })
+    };
+
     let on_submit = {
         let text = input_text.clone();
         let on_send = props.on_send.clone();
+        let is_at_bottom = is_at_bottom.clone();
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
             if !text.is_empty() {
                 on_send.emit((*text).clone());
                 text.set(String::new());
+                // Force snap to bottom when user sends a message
+                is_at_bottom.set(true);
             }
         })
     };
@@ -50,19 +78,31 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
     let on_keydown = {
         let text = input_text.clone();
         let on_send = props.on_send.clone();
+        let is_at_bottom = is_at_bottom.clone();
         Callback::from(move |e: KeyboardEvent| {
             if e.key() == "Enter" && !e.shift_key() {
                 e.prevent_default();
                 if !text.is_empty() {
                     on_send.emit((*text).clone());
                     text.set(String::new());
+                    // Force snap to bottom when user sends a message
+                    is_at_bottom.set(true);
                 }
             }
         })
     };
 
     let css = r#"
-        .messages-container { flex-grow: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 15px; background-color: #ffffff; }
+        .messages-container {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            background-color: #ffffff;
+            scroll-behavior: smooth;
+        }
 
         /* Row Layout */
         .message-row { display: flex; width: 100%; }
@@ -74,29 +114,28 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
         .bubble-group { display: flex; gap: 10px; max-width: 85%; align-items: flex-end; }
         .message-row.user .bubble-group { flex-direction: row-reverse; }
 
-        /* Avatars (Icons now, no text) */
+        /* Avatars */
         .avatar { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         .avatar.user { background: #555; color: white; }
         .avatar.assistant { background: var(--accent-color); color: white; }
 
         /* Text Bubble */
-        .msg-bubble { padding: 10px 15px; border-radius: 12px; font-size: 0.95rem; line-height: 1.5; box-shadow: 0 1px 2px rgba(0,0,0,0.05); overflow-wrap: break-word; min-width: 0; }
-
-        /* User Bubble */
-        .message-row.user .msg-bubble {
-            background-color: #e3f2fd;
-            color: #1565c0;
-            border-bottom-right-radius: 2px;
+        .msg-bubble {
+            padding: 10px 15px;
+            border-radius: 12px;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            min-width: 0;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            max-width: 100%;
         }
 
-        /* Assistant Bubble */
-        .message-row.assistant .msg-bubble {
-            background-color: #f5f5f5;
-            color: #333;
-            border-bottom-left-radius: 2px;
-        }
+        .message-row.user .msg-bubble { background-color: #e3f2fd; color: #1565c0; border-bottom-right-radius: 2px; }
+        .message-row.assistant .msg-bubble { background-color: #f5f5f5; color: #333; border-bottom-left-radius: 2px; }
 
-        /* SYSTEM MESSAGE STYLE (Restored) */
+        /* SYSTEM MESSAGE STYLE */
         .system-bubble {
             background-color: #fff3cd;
             color: #666;
@@ -106,6 +145,7 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
             border: 1px dashed #ccc;
             text-align: center;
             max-width: 90%;
+            overflow-wrap: anywhere;
         }
 
         /* Input Area Styles */
@@ -118,14 +158,14 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
         .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
     "#;
 
-    // SVGs for avatars
     let user_icon = html! { <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg> };
     let bot_icon = html! { <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"></rect><circle cx="12" cy="5" r="2"></circle><path d="M12 7v4"></path><line x1="8" y1="16" x2="8" y2="16"></line><line x1="16" y1="16" x2="16" y2="16"></line></svg> };
 
     html! {
         <>
             <style>{ css }</style>
-            <div class="messages-container" ref={scroll_ref}>
+            // NEW: Added onscroll handler here
+            <div class="messages-container" ref={scroll_ref} onscroll={on_scroll}>
                 { for props.messages.iter().map(|msg| {
                     if msg.role == "system" {
                         html! {
