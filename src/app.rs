@@ -63,9 +63,48 @@ pub fn app() -> Html {
     let show_settings = use_state(|| false);
     let is_loading = use_state(|| false);
     let cancellation_token = use_state(|| Arc::new(AtomicBool::new(false)));
+    let available_models = use_state(Vec::new);
 
     let current_chat = chats.iter().find(|c| c.id == *active_chat_id);
     let current_messages = current_chat.map(|c| c.messages.clone()).unwrap_or_default();
+
+    // --- EFFECTS ---
+
+    // Fetch models on startup if base_url is not default
+    {
+        let models = available_models.clone();
+        let settings = settings.clone();
+        use_effect_with(settings.clone(), move |settings_ref| {
+            let base_url = settings_ref.base_url.clone();
+            if base_url != "http://localhost:8080" {
+                let url = base_url.clone();
+                let models = models.clone();
+                let settings = settings.clone();
+                spawn_local(async move {
+                    match LlmService::fetch_models(&url).await {
+                        Ok(resp) => {
+                            let model_list: Vec<String> = resp.data.into_iter().map(|m| m.id).collect();
+                            models.set(model_list.clone());
+                            // If the saved model exists in the list, keep it; otherwise use the first one
+                            let current_settings: AppSettings = (*settings).clone();
+                            let saved_model = current_settings.selected_model.clone();
+                            if model_list.contains(&saved_model) {
+                                // Keep the saved model
+                            } else if let Some(first_model) = model_list.first().cloned() {
+                                // Update settings with the first available model
+                                let mut new_settings = current_settings.clone();
+                                new_settings.selected_model = first_model;
+                                settings.set(new_settings);
+                            }
+                        }
+                        Err(_) => {
+                            // If fetch fails, keep using the saved model
+                        }
+                    }
+                });
+            }
+        });
+    }
 
     // --- EFFECTS ---
     {
@@ -214,7 +253,7 @@ pub fn app() -> Html {
             spawn_local(async move {
                 let req = ChatRequest {
                     messages: history.clone(),
-                    model: set.selected_model.clone(),
+                    model: "/root/models/Strand-Rust-Coder-14B-v1".to_string(),//set.selected_model.clone(),
                     temperature: 0.7,
                     stream: set.stream_enabled,
                 };
