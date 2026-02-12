@@ -255,14 +255,10 @@ pub fn app() -> Html {
             // Spawn async task with document context
             spawn_local(async move {
                 // Get document context based on mode
-                let doc_context = if set.document_context_mode == crate::models::DocumentContextMode::RAG {
-                    let service = DocumentService::default();
-                    service.build_context(&msg_content, 3).await
-                } else {
-                    String::new()
-                };
+                let service = DocumentService::default();
+                let doc_context = service.build_context(&msg_content, 3).await;
 
-                // Prepend document context to user message in RAG mode
+                // Prepend document context to user message
                 let final_content = if !doc_context.is_empty() {
                     format!("{}User message:\n{}", doc_context, msg_content)
                 } else {

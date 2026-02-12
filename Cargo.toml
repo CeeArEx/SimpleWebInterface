@@ -45,5 +45,7 @@ features = [
     "EventTarget",
     "HtmlButtonElement",
     "HtmlDivElement",
-    "HtmlSpanElement"
+    "HtmlSpanElement",
+    "DomRect",
+    "DomRectReadOnly"
 ]

@@ -1,7 +1,9 @@
 use yew::prelude::*;
-use web_sys::{HtmlTextAreaElement, HtmlElement};
+use wasm_bindgen::JsCast;
+use web_sys::{HtmlTextAreaElement, HtmlElement, Element};
 use crate::models::Message;
 use crate::utils::render_markdown;
+use crate::services::document_service::DocumentService;
 
 #[derive(Properties, PartialEq)]
 pub struct ChatAreaProps {
@@ -14,9 +16,15 @@ pub struct ChatAreaProps {
 #[function_component(ChatArea)]
 pub fn chat_area(props: &ChatAreaProps) -> Html {
     let input_text = use_state(String::new);
+    let documents = use_state(|| vec![]);
+    // Clone documents handle for use in closures that need to refresh it
+    let documents_clone = documents.clone();
     let scroll_ref = use_node_ref();
     // NEW: Track if the user is currently at the bottom of the chat
     let is_at_bottom = use_state(|| true);
+    // @ mention dropdown state
+    let mention_position = use_state(|| None); // Some((x, y))
+    let mention_query = use_state(|| String::new());
 
     // Auto-scroll effect
     {
@@ -67,22 +75,29 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
         })
     };
 
-    let on_input = {
-        let text = input_text.clone();
-        Callback::from(move |e: InputEvent| {
-            let i: HtmlTextAreaElement = e.target_unchecked_into();
-            text.set(i.value());
-        })
-    };
+    // Load documents on mount
+    {
+        let docs = documents.clone();
+        use_effect_with(() as (), move |_| {
+            let loaded_docs = DocumentService::get_documents();
+            docs.set(loaded_docs);
+        });
+    }
 
     let on_keydown = {
         let text = input_text.clone();
         let on_send = props.on_send.clone();
         let is_at_bottom = is_at_bottom.clone();
+        let mention_pos = mention_position.clone();
+        let mention_q = mention_query.clone();
+        
         Callback::from(move |e: KeyboardEvent| {
             if e.key() == "Enter" && !e.shift_key() {
                 e.prevent_default();
                 if !text.is_empty() {
+                    // Clear mention state before sending
+                    mention_pos.set(None);
+                    mention_q.set(String::new());
                     on_send.emit((*text).clone());
                     text.set(String::new());
                     // Force snap to bottom when user sends a message
@@ -91,6 +106,94 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
             }
         })
     };
+
+    let on_input = {
+        let text = input_text.clone();
+        let mention_pos = mention_position.clone();
+        let mention_q = mention_query.clone();
+        let documents_clone_for_set = documents_clone.clone();
+        
+        Callback::from(move |e: InputEvent| {
+            let i: HtmlTextAreaElement = e.target_unchecked_into();
+            let val = i.value();
+            text.set(val.clone());
+            
+            // Check for @ mention
+            if let Some(pos) = val.rfind('@') {
+                // Check if there's no space after @ (and it's not part of @doc-id)
+                let after_at = &val[pos+1..];
+                if !after_at.contains(' ') && !after_at.contains('\n') {
+                    // Get the text after @ to use as query
+                    let query = after_at.to_string();
+                    mention_q.set(query.clone());
+                    
+                    // Fetch fresh documents from localStorage
+                    let loaded_docs = DocumentService::get_documents();
+                    documents_clone_for_set.set(loaded_docs);
+                    
+                    // Calculate position for dropdown
+                    let element: Element = i.unchecked_into();
+                    let rect = Element::get_bounding_client_rect(&element);
+                    
+                    // Get viewport dimensions to determine if dropdown should be above or below
+                    let window = web_sys::window().unwrap();
+                    let viewport_height = window.inner_height().ok().and_then(|h| h.as_f64()).map(|h| h as i32).unwrap_or(800);
+                    let textarea_top = rect.top() as i32;
+                    let textarea_bottom = (rect.top() + rect.height()) as i32;
+                    
+                    // Calculate available space above and below
+                    let space_below = viewport_height - textarea_bottom;
+                    let space_above = textarea_top;
+
+                    // Dropdown height estimate (item height + padding)
+                    // Use a reasonable default since we can't access documents here
+                    let estimated_height = 200; // ~200px estimated dropdown height
+
+                    // If there's enough space below, show below; otherwise show above
+                    let (x, y) = if space_below >= estimated_height || space_below > space_above {
+                        // Show below textarea
+                        (rect.left() as i32, textarea_bottom + 5)
+                    } else if space_above >= estimated_height {
+                        // Show above textarea
+                        (rect.left() as i32, textarea_top as i32 - estimated_height)
+                    } else {
+                        // Fallback: show below
+                        (rect.left() as i32, textarea_bottom + 5)
+                    };
+                    
+                    mention_pos.set(Some((x, y)));
+                    return;
+                }
+            }
+            
+            // Clear mention state if @ is not present or has space after
+            mention_pos.set(None);
+            mention_q.set(String::new());
+        })
+    };
+
+    let on_select_document = {
+        let text = input_text.clone();
+        let mention_pos = mention_position.clone();
+        let mention_query_handle = mention_query.clone();
+        
+        Callback::from(move |doc_id: String| {
+            // Replace the @query with @doc-id
+            let current_text = text.to_string();
+            if let Some(pos) = current_text.rfind('@') {
+                let before_at = current_text[..pos].to_string();
+                let current_query = mention_query_handle.to_string();
+                let after_query = &current_text[pos+current_query.len()+1..];
+                let new_text = format!("{}@{}{}", before_at, doc_id, after_query);
+                text.set(new_text);
+                mention_pos.set(None);
+                mention_query_handle.set(String::new());
+            }
+        })
+    };
+    
+    // Use mention_query directly in the dropdown rendering
+    // This avoids the borrow checker error since we're using a reference
 
     let css = r#"
         .messages-container {
@@ -149,22 +252,108 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
         }
 
         /* Input Area Styles */
-        .input-wrapper { border-top: 1px solid var(--border-color); padding: 20px; display: flex; justify-content: center; background: white; }
+        .input-wrapper { border-top: 1px solid var(--border-color); padding: 20px; display: flex; justify-content: center; background: white; position: relative; }
         .input-container { width: 100%; max-width: 900px; position: relative; display: flex; flex-direction: column; }
         .chat-input { width: 100%; padding: 12px; padding-right: 45px; border: 1px solid var(--border-color); border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); resize: none; font-family: inherit; outline: none; transition: border 0.2s; }
         .chat-input:focus { border-color: var(--accent-color); box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.1); }
         .send-btn { position: absolute; right: 8px; bottom: 8px; background: var(--accent-color); color: white; border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; transition: opacity 0.2s; }
         .send-btn:disabled { background: #ccc; cursor: default; }
         .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
+
+        /* Document Mention Dropdown */
+        .document-mention-dropdown {
+            position: absolute;
+            background: white;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            overflow: hidden;
+            max-height: 300px;
+            overflow-y: auto;
+            width: 250px;
+            z-index: 100;
+        }
+        .document-mention-item {
+            padding: 10px 12px;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .document-mention-item:last-child {
+            border-bottom: none;
+        }
+        .document-mention-item:hover {
+            background: #f5f5f5;
+        }
+        .document-mention-name {
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+        .document-mention-meta {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+        .document-mention-no-results {
+            padding: 10px 12px;
+            color: var(--text-secondary);
+            text-align: center;
+        }
     "#;
 
     let user_icon = html! { <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg> };
     let bot_icon = html! { <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"></rect><circle cx="12" cy="5" r="2"></circle><path d="M12 7v4"></path><line x1="8" y1="16" x2="8" y2="16"></line><line x1="16" y1="16" x2="16" y2="16"></line></svg> };
 
+    // Document mention dropdown
+    let mention_dropdown = {
+        let mention_pos = *mention_position;
+        let mention_q = mention_query.clone();
+        // Fetch fresh documents from localStorage for the dropdown
+        let docs = DocumentService::get_documents();
+        
+        if let Some((x, y)) = mention_pos {
+            let query = mention_query.to_string();
+            let filtered_docs: Vec<_> = docs.iter()
+                .filter(|d| d.filename.to_lowercase().contains(&query.to_lowercase()))
+                .collect();
+            
+            if !filtered_docs.is_empty() {
+                let style_val = format!("left: {}px; top: {}px;", x, y);
+                html! {
+                    <div class="document-mention-dropdown" {style_val}>
+                        { for filtered_docs.iter().map(|doc| {
+                            let doc_id = doc.id.clone();
+                            let doc_name = doc.filename.clone();
+                            let on_select = on_select_document.clone();
+                            html! {
+                                <div class="document-mention-item" onclick={Callback::from(move |_| on_select.emit(doc_id.clone()))}>
+                                    <div class="document-mention-name">{ &doc_name }</div>
+                                    <div class="document-mention-meta">{ doc.chunk_count } { "chunks" }</div>
+                                </div>
+                            }
+                        }) }
+                    </div>
+                }
+            } else {
+                let style_val = format!("left: {}px; top: {}px;", x, y);
+                html! {
+                    <div class="document-mention-dropdown" {style_val}>
+                        <div class="document-mention-no-results">
+                            { "No documents found" }
+                        </div>
+                    </div>
+                }
+            }
+        } else {
+            html! { <></> }
+        }
+    };
+
     html! {
         <>
             <style>{ css }</style>
-            // NEW: Added onscroll handler here
             <div class="messages-container" ref={scroll_ref} onscroll={on_scroll}>
                 { for props.messages.iter().map(|msg| {
                     if msg.role == "system" {
@@ -220,6 +409,7 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
                         disabled={props.is_loading}
                         style="height: 50px; overflow-y: hidden;"
                     />
+                    { mention_dropdown }
                     if props.is_loading {
                         <button type="button" class="send-btn" style="background: var(--danger-color);" onclick={props.on_stop.reform(|_| ())}>{"Stop"}</button>
                     } else {
