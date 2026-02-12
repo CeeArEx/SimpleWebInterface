@@ -36,6 +36,35 @@ pub struct SavedPrompt {
     pub content: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct DocumentChunk {
+    pub id: String,
+    pub document_id: String,
+    pub chunk_index: usize,
+    pub content: String,
+    pub created_at: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct Document {
+    pub id: String,
+    pub filename: String,
+    pub file_type: String,
+    pub upload_date: f64,
+    pub chunk_count: usize,
+    pub total_tokens: usize,
+    pub content_preview: String,
+    pub full_content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub enum DocumentContextMode {
+    #[serde(rename = "manual")]
+    Manual,  // User manually references documents
+    #[default]
+    RAG,     // Automatic retrieval of relevant chunks (default)
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AppSettings {
     pub system_prompt: String,
@@ -44,6 +73,8 @@ pub struct AppSettings {
     pub stream_enabled: bool,
     #[serde(default)] // Ensures backward compatibility with existing localStorage data
     pub saved_prompts: Vec<SavedPrompt>,
+    #[serde(default)] // Ensures backward compatibility with existing localStorage data
+    pub document_context_mode: DocumentContextMode,
 }
 
 impl Default for AppSettings {
@@ -54,6 +85,7 @@ impl Default for AppSettings {
             selected_model: "default".to_string(),
             stream_enabled: true,
             saved_prompts: Vec::new(),
+            document_context_mode: DocumentContextMode::RAG,
         }
     }
 }

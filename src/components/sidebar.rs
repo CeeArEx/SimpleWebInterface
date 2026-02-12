@@ -1,5 +1,6 @@
 use yew::prelude::*;
 use crate::models::ChatSession;
+use crate::components::documents::Documents;
 
 #[derive(Properties, PartialEq)]
 pub struct SidebarProps {
@@ -56,6 +57,8 @@ pub fn sidebar(props: &SidebarProps) -> Html {
                             }
                         })}
                     </div>
+
+                    <Documents on_document_selected={Callback::from(|id: String| { let _ = id; })} />
                 </div>
             </div>
         </>

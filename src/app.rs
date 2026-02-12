@@ -2,9 +2,11 @@ use yew::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use futures_util::StreamExt;
 use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen::JsCast;
+use web_sys::console;
 
 use crate::models::*;
-use crate::services::{storage::LocalStorage, llm::LlmService};
+use crate::services::{storage::LocalStorage, llm::LlmService, document_service::DocumentService};
 use crate::components::{sidebar::Sidebar, settings::SettingsModal, chat_area::ChatArea};
 
 const KEY_CHATS: &str = "llm_chats_v2";
@@ -250,7 +252,45 @@ pub fn app() -> Html {
             let cid = current_id.clone();
             let title_override = new_title_opt.clone(); // <--- Pass the new title into the async block
 
+            // Spawn async task with document context
             spawn_local(async move {
+                // Get document context based on mode
+                let doc_context = if set.document_context_mode == crate::models::DocumentContextMode::RAG {
+                    let service = DocumentService::default();
+                    service.build_context(&msg_content, 3).await
+                } else {
+                    String::new()
+                };
+
+                // Prepend document context to user message in RAG mode
+                let final_content = if !doc_context.is_empty() {
+                    format!("{}User message:\n{}", doc_context, msg_content)
+                } else {
+                    msg_content.clone()
+                };
+
+                // DEBUG: Log what's being sent to the model
+                console::log_1(&format!("--- Chat Request Debug ---").into());
+                console::log_1(&format!("Original message: {}", msg_content).into());
+                console::log_1(&format!("Document context mode: {:?}", set.document_context_mode).into());
+                if !doc_context.is_empty() {
+                    console::log_1(&format!("Document context ({} chars): {}...", doc_context.len(), &doc_context[..std::cmp::min(200, doc_context.len())]).into());
+                }
+                console::log_1(&format!("Final content sent to model: {}...", &final_content[..std::cmp::min(300, final_content.len())]).into());
+                console::log_1(&format!("--- End Debug ---").into());
+
+                // Update history with final content (including document context)
+                if let Some(last_msg) = history.last_mut() {
+                    if last_msg.role == "user" {
+                        last_msg.content = final_content.clone();
+                    }
+                }
+
+                console::log_1(&format!("History messages count: {}", history.len()).into());
+                for (i, msg) in history.iter().enumerate() {
+                    console::log_1(&format!("  [{}] Role: {}, Content ({} chars): {}...", i, msg.role, msg.content.len(), &msg.content[..std::cmp::min(100, msg.content.len())]).into());
+                }
+
                 let req = ChatRequest {
                     messages: history.clone(),
                     model: "/root/models/Strand-Rust-Coder-14B-v1".to_string(),//set.selected_model.clone(),
