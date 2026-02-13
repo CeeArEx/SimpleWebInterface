@@ -75,6 +75,21 @@ pub fn settings_modal(props: &SettingsProps) -> Html {
         })
     };
 
+    let on_doc_context_mode_change = {
+        let settings = props.settings.clone();
+        let updater = update_settings.clone();
+        Callback::from(move |e: Event| {
+            let select: HtmlSelectElement = e.target_unchecked_into();
+            let mut s = settings.clone();
+            s.document_context_mode = if select.value() == "rag" {
+                crate::models::DocumentContextMode::RAG
+            } else {
+                crate::models::DocumentContextMode::Manual
+            };
+            updater(s);
+        })
+    };
+
     let on_fetch = {
         let base_url = props.settings.base_url.clone();
         let models = available_models.clone();
@@ -253,6 +268,17 @@ pub fn settings_modal(props: &SettingsProps) -> Html {
                     <input type="checkbox" checked={props.settings.stream_enabled} onchange={on_stream_change}/>
                     { "Stream Responses" }
                 </label>
+
+                <div>
+                    <label class="form-label">{ "Document Context Mode" }</label>
+                    <select class="form-select" onchange={on_doc_context_mode_change}>
+                        <option value="rag" selected={props.settings.document_context_mode == crate::models::DocumentContextMode::RAG}>{ "RAG (Automatic Context)" }</option>
+                        <option value="manual" selected={props.settings.document_context_mode == crate::models::DocumentContextMode::Manual}>{ "Manual (Use @doc-id in prompts)" }</option>
+                    </select>
+                    <p style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 5px;">
+                        { "Choose how documents are used in conversations." }
+                    </p>
+                </div>
 
                 <div class="actions">
                     <hr style="width: 100%; border: 0; border-top: 1px solid var(--border-color);" />
