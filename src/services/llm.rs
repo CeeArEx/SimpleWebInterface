@@ -1,4 +1,4 @@
-use crate::models::{ChatRequest, ChatResponse, Message, ModelListResponse};
+use crate::models::{ChatRequest, ChatResponse, Message, MessageMetrics, ModelListResponse};
 use anyhow::Result;
 use reqwest::{Client, Response};
 
@@ -40,7 +40,8 @@ impl LlmService {
         let mut summary_messages = messages.to_vec();
         summary_messages.push(Message {
             role: "user".into(),
-            content: "Generate a short title (4-6 words) for this chat. No quotes.".into()
+            content: "Generate a short title (4-6 words) for this chat. No quotes.".into(),
+            metrics: MessageMetrics::default()
         });
 
         let req = ChatRequest {

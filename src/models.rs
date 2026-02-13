@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub metrics: MessageMetrics,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -23,6 +25,7 @@ impl ChatSession {
             messages: vec![Message {
                 role: "system".to_string(),
                 content: system_prompt,
+                metrics: MessageMetrics::default(),
             }],
             created_at: js_sys::Date::now(),
         }
@@ -90,7 +93,7 @@ impl Default for AppSettings {
     }
 }
 
-// API DTOs (Unchanged)
+// API DTOs
 #[derive(Serialize, Debug)]
 pub struct ChatRequest {
     pub messages: Vec<Message>,
@@ -102,25 +105,58 @@ pub struct ChatRequest {
 #[derive(Deserialize, Debug)]
 pub struct ChatResponse {
     pub choices: Vec<ChatChoice>,
+    #[serde(default)]
+    pub usage: Option<UsageInfo>,
+    #[serde(default)]
+    pub timings: Option<TimingsInfo>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub created: Option<i64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub system_fingerprint: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct ChatChoice {
+    #[serde(default)]
     pub message: Message,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct StreamResponse {
     pub choices: Vec<StreamChoice>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub created: Option<i64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub system_fingerprint: Option<String>,
+    #[serde(default)]
+    pub usage: Option<UsageInfo>,
+    #[serde(default)]
+    pub timings: Option<TimingsInfo>,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct StreamChoice {
+    #[serde(default)]
     pub delta: StreamDelta,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+    #[serde(default)]
+    pub index: Option<u32>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct StreamDelta {
+    #[serde(default)]
     pub content: Option<String>,
 }
 
@@ -132,4 +168,42 @@ pub struct ModelListResponse {
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct ModelInfo {
     pub id: String,
+}
+
+// Metrics and Timing Info
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct UsageInfo {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct TimingsInfo {
+    pub cache_n: usize,
+    pub prompt_n: usize,
+    pub prompt_ms: f64,
+    pub prompt_per_token_ms: f64,
+    pub prompt_per_second: f64,
+    pub predicted_n: usize,
+    pub predicted_ms: f64,
+    pub predicted_per_token_ms: f64,
+    pub predicted_per_second: f64,
+}
+
+// Data stored with each message for display
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct MessageMetrics {
+    pub usage: Option<UsageInfo>,
+    pub timings: Option<TimingsInfo>,
+    pub created: Option<i64>,
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub system_fingerprint: Option<String>,
+}
+
+impl MessageMetrics {
+    pub fn is_empty(&self) -> bool {
+        self.usage.is_none() && self.timings.is_none() && self.created.is_none() && self.id.is_none() && self.model.is_none() && self.system_fingerprint.is_none()
+    }
 }

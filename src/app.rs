@@ -2,7 +2,6 @@ use yew::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use futures_util::StreamExt;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::console;
 
 use crate::models::*;
 use crate::services::{storage::LocalStorage, llm::LlmService, document_service::DocumentService};
@@ -222,7 +221,7 @@ pub fn app() -> Html {
             token.store(false, Ordering::Relaxed);
 
             let mut history = chats.iter().find(|c| c.id == current_id).map(|c| c.messages.clone()).unwrap_or_default();
-            history.push(Message { role: "user".into(), content: msg_content.clone() });
+            history.push(Message { role: "user".into(), content: msg_content.clone(), metrics: MessageMetrics::default() });
 
             // 1. Calculate Title if needed
             let mut new_title_opt = None;
@@ -265,26 +264,11 @@ pub fn app() -> Html {
                     (ctx.clone(), ctx + "User message:\n" + &msg_content)
                 };
 
-                // DEBUG: Log what's being sent to the model
-                console::log_1(&format!("--- Chat Request Debug ---").into());
-                console::log_1(&format!("Original message: {}", msg_content).into());
-                console::log_1(&format!("Document context mode: {:?}", set.document_context_mode).into());
-                if !doc_context.is_empty() {
-                    console::log_1(&format!("Document context ({} chars): {}...", doc_context.len(), &doc_context[..std::cmp::min(200, doc_context.len())]).into());
-                }
-                console::log_1(&format!("Display message: {}...", &display_message[..std::cmp::min(300, display_message.len())]).into());
-                console::log_1(&format!("--- End Debug ---").into());
-
                 // Update history with the display message (clean version)
                 if let Some(last_msg) = history.last_mut() {
                     if last_msg.role == "user" {
                         last_msg.content = display_message.clone();
                     }
-                }
-
-                console::log_1(&format!("History messages count: {}", history.len()).into());
-                for (i, msg) in history.iter().enumerate() {
-                    console::log_1(&format!("  [{}] Role: {}, Content ({} chars): {}...", i, msg.role, msg.content.len(), &msg.content[..std::cmp::min(100, msg.content.len())]).into());
                 }
 
                 // Create messages with full context for LLM
@@ -295,7 +279,8 @@ pub fn app() -> Html {
                     llm_messages.pop();
                     llm_messages.push(Message {
                         role: "user".to_string(),
-                        content: llm_user_content
+                        content: llm_user_content,
+                        metrics: MessageMetrics::default()
                     });
                 }
 
@@ -321,10 +306,20 @@ pub fn app() -> Html {
 
                 if let Ok(resp) = LlmService::chat_completion_request(&set.base_url, &req).await {
                     if set.stream_enabled {
-                        history.push(Message { role: "assistant".into(), content: "".into() });
-                        update(history.clone());
+                        // For streaming, we need to capture metrics from the final response
+                        // We'll use a wrapper response that also contains timing info
                         let mut stream = resp.bytes_stream();
                         let mut buffer = String::new();
+                        let mut final_usage: Option<UsageInfo> = None;
+                        let mut final_timings: Option<TimingsInfo> = None;
+                        let mut final_id: Option<String> = None;
+                        let mut final_created: Option<i64> = None;
+                        let mut final_model: Option<String> = None;
+                        let mut final_fingerprint: Option<String> = None;
+                        
+                        history.push(Message { role: "assistant".into(), content: "".into(), metrics: MessageMetrics::default() });
+                        update(history.clone());
+                        
                         while let Some(item) = stream.next().await {
                             if cancel.load(Ordering::Relaxed) { break; }
                             if let Ok(chunk) = item {
@@ -334,8 +329,24 @@ pub fn app() -> Html {
                                     buffer.drain(..pos+1);
                                     if line.starts_with("data: ") && line != "data: [DONE]" {
                                         if let Ok(json) = serde_json::from_str::<StreamResponse>(&line[6..]) {
+                                            // Extract timing info if available in chunk
+                                            final_id = json.id.clone();
+                                            final_created = json.created;
+                                            final_model = json.model.clone();
+                                            final_fingerprint = json.system_fingerprint.clone();
+                                            
+                                            // Update usage and timings if present in the chunk
+                                            if let Some(usage) = json.usage {
+                                                final_usage = Some(usage);
+                                            }
+                                            if let Some(timings) = json.timings {
+                                                final_timings = Some(timings);
+                                            }
+                                            
                                             if let Some(txt) = json.choices[0].delta.content.as_ref() {
-                                                if let Some(last) = history.last_mut() { last.content.push_str(txt); }
+                                                if let Some(last) = history.last_mut() { 
+                                                    last.content.push_str(txt); 
+                                                }
                                                 update(history.clone());
                                             }
                                         }
@@ -343,10 +354,35 @@ pub fn app() -> Html {
                                 }
                             }
                         }
+                        
+                        // Store the metrics we captured during streaming
+                        if let Some(last) = history.last_mut() {
+                            last.metrics = MessageMetrics {
+                                usage: final_usage,
+                                timings: final_timings,
+                                created: final_created,
+                                id: final_id,
+                                model: final_model,
+                                system_fingerprint: final_fingerprint,
+                            };
+                        }
+                        // Update the UI with the final metrics
+                        update(history.clone());
                     } else {
+                        // Non-streaming: extract all metrics from the full response
                         if let Ok(json) = resp.json::<ChatResponse>().await {
                             if let Some(choice) = json.choices.first() {
-                                history.push(choice.message.clone());
+                                let metrics = MessageMetrics {
+                                    usage: json.usage.clone(),
+                                    timings: json.timings.clone(),
+                                    created: json.created,
+                                    id: json.id.clone(),
+                                    model: json.model.clone(),
+                                    system_fingerprint: json.system_fingerprint.clone(),
+                                };
+                                let mut msg = choice.message.clone();
+                                msg.metrics = metrics;
+                                history.push(msg);
                                 update(history);
                             }
                         }

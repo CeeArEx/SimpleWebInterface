@@ -226,6 +226,51 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
         })
     };
 
+    let format_metrics = |metrics: &crate::models::MessageMetrics| -> String {
+        let mut parts = Vec::new();
+        
+        // Format usage info
+        if let Some(usage) = &metrics.usage {
+            parts.push(format!("{}↑ {}↓ {}",
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ));
+        }
+        
+        // Format timing info
+        if let Some(timings) = &metrics.timings {
+            let prompt_time = format!("{:.1}ms", timings.prompt_ms);
+            let gen_time = format!("{:.1}ms", timings.predicted_ms);
+            let prompt_speed = format!("{:.0} t/s", timings.prompt_per_second);
+            let gen_speed = format!("{:.0} t/s", timings.predicted_per_second);
+            
+            parts.push(format!("{} {} | {} {}", prompt_time, prompt_speed, gen_time, gen_speed));
+        }
+        
+        // If no usage/timings but we have some metadata, show what we have
+        if parts.is_empty() {
+            if let Some(created) = metrics.created {
+                parts.push(format!("Created: {}", created));
+            }
+            if let Some(model) = &metrics.model {
+                parts.push(format!("Model: {}", model));
+            }
+            if let Some(id) = &metrics.id {
+                parts.push(format!("ID: {}", id));
+            }
+            if let Some(fingerprint) = &metrics.system_fingerprint {
+                parts.push(format!("Fingerprint: {}", fingerprint));
+            }
+        }
+        
+        if parts.is_empty() {
+            "No metrics available".to_string()
+        } else {
+            parts.join(" | ")
+        }
+    };
+
     let css = r#"
         .messages-container {
             flex-grow: 1;
@@ -280,6 +325,27 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
             text-align: center;
             max-width: 90%;
             overflow-wrap: anywhere;
+        }
+
+        /* Metrics Display */
+        .msg-metrics {
+            margin-top: 6px;
+            padding: 6px 12px;
+            background-color: #f0f0f0;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            color: #666;
+            font-family: monospace;
+            max-width: 85%;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .msg-metrics span {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
         }
 
         /* Input Area Styles */
@@ -423,11 +489,21 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
                             ("assistant", bot_icon.clone())
                         };
 
+                        let metrics_html = if msg.role == "assistant" && !msg.metrics.is_empty() {
+                            let metrics_text = format_metrics(&msg.metrics);
+                            html! { <div class="msg-metrics">{ metrics_text }</div> }
+                        } else {
+                            html! { <></> }
+                        };
+
                         html! {
                             <div class={format!("message-row {}", role_cls)}>
                                 <div class="bubble-group">
                                     <div class={format!("avatar {}", avatar_cls)}>{ icon }</div>
-                                    <div class="msg-bubble">{ render_markdown(&msg.content) }</div>
+                                    <div>
+                                        <div class="msg-bubble">{ render_markdown(&msg.content) }</div>
+                                        { metrics_html }
+                                    </div>
                                 </div>
                             </div>
                         }
