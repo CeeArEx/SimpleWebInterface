@@ -157,6 +157,21 @@ pub fn settings_modal(props: &SettingsProps) -> Html {
         })
     };
 
+    // Prepare the show_metrics handler outside of the html block
+    let on_show_metrics_change = {
+        let updater = update_settings.clone();
+        let settings = props.settings.clone();
+        Callback::from(move |e: Event| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            let new_show_metrics = input.checked();
+            let mut s = settings.clone();
+            s.show_metrics = new_show_metrics;
+            updater(s);
+        })
+    };
+
+    let show_metrics_checked = props.settings.show_metrics;
+
     let css = r#"
         .settings-backdrop { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255,255,255,0.6); backdrop-filter: blur(2px); z-index: 99; cursor: pointer; }
         .settings-panel { position: absolute; top: 60px; right: 20px; width: 400px; background: white; border: 1px solid var(--border-color); border-radius: 8px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); padding: 20px; z-index: 100; display: flex; flex-direction: column; gap: 15px; max-height: 80vh; overflow-y: auto; }
@@ -267,6 +282,11 @@ pub fn settings_modal(props: &SettingsProps) -> Html {
                 <label style="display: flex; gap: 8px; align-items: center; cursor: pointer; font-size: 0.9rem;">
                     <input type="checkbox" checked={props.settings.stream_enabled} onchange={on_stream_change}/>
                     { "Stream Responses" }
+                </label>
+
+                <label style="display: flex; gap: 8px; align-items: center; cursor: pointer; font-size: 0.9rem;">
+                    <input type="checkbox" checked={show_metrics_checked} onchange={on_show_metrics_change}/>
+                    { "Show Metrics" }
                 </label>
 
                 <div>

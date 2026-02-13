@@ -2,7 +2,7 @@ use yew::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{HtmlElement, HtmlTextAreaElement, Element};
 
-use crate::models::Message;
+use crate::models::{Message, AppSettings};
 use crate::services::document_service::DocumentService;
 use crate::utils::render_markdown;
 
@@ -12,6 +12,7 @@ pub struct ChatAreaProps {
     pub is_loading: bool,
     pub on_send: Callback<String>,
     pub on_stop: Callback<()>,
+    pub show_metrics: AppSettings,
 }
 
 #[function_component(ChatArea)]
@@ -229,9 +230,9 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
     let format_metrics = |metrics: &crate::models::MessageMetrics| -> String {
         let mut parts = Vec::new();
         
-        // Format usage info
+        // Format usage info (token counts)
         if let Some(usage) = &metrics.usage {
-            parts.push(format!("{}↑ {}↓ {}",
+            parts.push(format!("input: {} | output: {} | total: {}",
                 usage.prompt_tokens,
                 usage.completion_tokens,
                 usage.total_tokens
@@ -240,12 +241,13 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
         
         // Format timing info
         if let Some(timings) = &metrics.timings {
-            let prompt_time = format!("{:.1}ms", timings.prompt_ms);
-            let gen_time = format!("{:.1}ms", timings.predicted_ms);
-            let prompt_speed = format!("{:.0} t/s", timings.prompt_per_second);
-            let gen_speed = format!("{:.0} t/s", timings.predicted_per_second);
+            // Format: prompt: 90ms 243t/s | gen: 472ms 49t/s
+            let prompt_time = format!("{}ms", timings.prompt_ms.round() as usize);
+            let gen_time = format!("{}ms", timings.predicted_ms.round() as usize);
+            let prompt_speed = format!("{}t/s", timings.prompt_per_second.round() as usize);
+            let gen_speed = format!("{}t/s", timings.predicted_per_second.round() as usize);
             
-            parts.push(format!("{} {} | {} {}", prompt_time, prompt_speed, gen_time, gen_speed));
+            parts.push(format!("prompt: {} {} | gen: {} {}", prompt_time, prompt_speed, gen_time, gen_speed));
         }
         
         // If no usage/timings but we have some metadata, show what we have
@@ -489,7 +491,7 @@ pub fn chat_area(props: &ChatAreaProps) -> Html {
                             ("assistant", bot_icon.clone())
                         };
 
-                        let metrics_html = if msg.role == "assistant" && !msg.metrics.is_empty() {
+                        let metrics_html = if props.show_metrics.show_metrics && msg.role == "assistant" && !msg.metrics.is_empty() {
                             let metrics_text = format_metrics(&msg.metrics);
                             html! { <div class="msg-metrics">{ metrics_text }</div> }
                         } else {

@@ -368,6 +368,25 @@ pub fn app() -> Html {
                         }
                         // Update the UI with the final metrics
                         update(history.clone());
+                        
+                        // Some APIs (like Ollama) return usage in a final non-data chunk after streaming
+                        // Let's try to parse any remaining content in the buffer
+                        if !buffer.is_empty() {
+                            if let Ok(json) = serde_json::from_str::<StreamResponse>(&buffer) {
+                                if let Some(usage) = json.usage {
+                                    if let Some(last) = history.last_mut() {
+                                        last.metrics.usage = Some(usage);
+                                    }
+                                }
+                                if let Some(timings) = json.timings {
+                                    if let Some(last) = history.last_mut() {
+                                        last.metrics.timings = Some(timings);
+                                    }
+                                }
+                                // Update if we got new data
+                                update(history.clone());
+                            }
+                        }
                     } else {
                         // Non-streaming: extract all metrics from the full response
                         if let Ok(json) = resp.json::<ChatResponse>().await {
@@ -474,6 +493,7 @@ pub fn app() -> Html {
                         is_loading={*is_loading}
                         on_send={run_chat}
                         on_stop={on_stop}
+                        show_metrics={(*settings).clone()}
                     />
                 </div>
             </div>

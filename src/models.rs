@@ -78,6 +78,8 @@ pub struct AppSettings {
     pub saved_prompts: Vec<SavedPrompt>,
     #[serde(default)] // Ensures backward compatibility with existing localStorage data
     pub document_context_mode: DocumentContextMode,
+    #[serde(default)] // Ensures backward compatibility with existing localStorage data
+    pub show_metrics: bool,
 }
 
 impl Default for AppSettings {
@@ -89,6 +91,7 @@ impl Default for AppSettings {
             stream_enabled: true,
             saved_prompts: Vec::new(),
             document_context_mode: DocumentContextMode::RAG,
+            show_metrics: true, // Default to showing metrics
         }
     }
 }
