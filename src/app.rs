@@ -2,7 +2,6 @@ use yew::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use futures_util::StreamExt;
 use wasm_bindgen_futures::spawn_local;
-use wasm_bindgen::JsCast;
 use web_sys::console;
 
 use crate::models::*;
@@ -256,13 +255,14 @@ pub fn app() -> Html {
             spawn_local(async move {
                 // Get document context based on mode
                 let service = DocumentService::default();
-                let doc_context = service.build_context(&msg_content, 3).await;
-
-                // Prepend document context to user message
-                let final_content = if !doc_context.is_empty() {
-                    format!("{}User message:\n{}", doc_context, msg_content)
+                
+                // For manual mode, we need both the context for LLM and clean display
+                let (doc_context, display_message) = if set.document_context_mode == DocumentContextMode::Manual {
+                    service.build_manual_context_with_display(&msg_content).await
                 } else {
-                    msg_content.clone()
+                    // For RAG mode, use the original context builder
+                    let ctx = service.build_context(&msg_content, 3).await;
+                    (ctx.clone(), ctx + "User message:\n" + &msg_content)
                 };
 
                 // DEBUG: Log what's being sent to the model
@@ -272,13 +272,13 @@ pub fn app() -> Html {
                 if !doc_context.is_empty() {
                     console::log_1(&format!("Document context ({} chars): {}...", doc_context.len(), &doc_context[..std::cmp::min(200, doc_context.len())]).into());
                 }
-                console::log_1(&format!("Final content sent to model: {}...", &final_content[..std::cmp::min(300, final_content.len())]).into());
+                console::log_1(&format!("Display message: {}...", &display_message[..std::cmp::min(300, display_message.len())]).into());
                 console::log_1(&format!("--- End Debug ---").into());
 
-                // Update history with final content (including document context)
+                // Update history with the display message (clean version)
                 if let Some(last_msg) = history.last_mut() {
                     if last_msg.role == "user" {
-                        last_msg.content = final_content.clone();
+                        last_msg.content = display_message.clone();
                     }
                 }
 
@@ -287,8 +287,20 @@ pub fn app() -> Html {
                     console::log_1(&format!("  [{}] Role: {}, Content ({} chars): {}...", i, msg.role, msg.content.len(), &msg.content[..std::cmp::min(100, msg.content.len())]).into());
                 }
 
+                // Create messages with full context for LLM
+                let mut llm_messages = history.clone();
+                if !doc_context.is_empty() {
+                    // For LLM, prepend document context and keep original message
+                    let llm_user_content = format!("{}User message:\n{}", doc_context, msg_content);
+                    llm_messages.pop();
+                    llm_messages.push(Message {
+                        role: "user".to_string(),
+                        content: llm_user_content
+                    });
+                }
+
                 let req = ChatRequest {
-                    messages: history.clone(),
+                    messages: llm_messages,
                     model: "/root/models/Strand-Rust-Coder-14B-v1".to_string(),//set.selected_model.clone(),
                     temperature: 0.7,
                     stream: set.stream_enabled,
@@ -407,7 +419,7 @@ pub fn app() -> Html {
                             <h2>{ if let Some(c) = &current_chat { &c.title } else { "Local LLM" } }</h2>
                         </div>
                         <button class="btn-icon" onclick={Callback::from(move |_| toggle_settings.set(!*toggle_settings))} title="Settings">
-                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06-.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
                         </button>
                     </div>
 

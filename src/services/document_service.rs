@@ -196,6 +196,50 @@ impl DocumentService {
     }
 
     /// Build context for manual mode by extracting @doc-id references from the query
+    /// Returns both the context (for LLM) and the cleaned message (for display)
+    pub async fn build_manual_context_with_display(&self, query: &str) -> (String, String) {
+        let documents = Self::get_documents();
+        
+        if documents.is_empty() {
+            return (String::new(), query.to_string());
+        }
+
+        // Find all @doc-id patterns in the query
+        let mut referenced_docs: Vec<String> = Vec::new();
+        let mut current_query = query.to_string();
+        
+        for doc in &documents {
+            let doc_ref = format!("@{}", doc.id);
+            if query.contains(&doc_ref) && !referenced_docs.contains(&doc.id) {
+                referenced_docs.push(doc.id.clone());
+                
+                // Replace @doc-id with a cleaner placeholder for display
+                current_query = current_query.replace(&doc_ref, &format!("[Document: {}]", doc.filename));
+            }
+        }
+
+        // Build the context with referenced document content (for LLM)
+        let mut context = String::from("Document context:\n\n");
+        for doc_id in &referenced_docs {
+            if let Some(doc_content) = Self::get_document_content_by_id(doc_id) {
+                if let Some(doc) = documents.iter().find(|d| d.id == *doc_id) {
+                    context.push_str(&format!(
+                        "=== Document: {} (Type: {}, Chunks: {}) ===\n{}\n\n",
+                        doc.filename, doc.file_type, doc.chunk_count, doc_content
+                    ));
+                }
+            }
+        }
+
+        // If no documents were referenced, return empty context and original query
+        if referenced_docs.is_empty() {
+            return (String::new(), query.to_string());
+        }
+
+        (context, current_query)
+    }
+
+    /// Build context for manual mode by extracting @doc-id references from the query
     fn build_manual_context(query: &str) -> String {
         let documents = Self::get_documents();
         
